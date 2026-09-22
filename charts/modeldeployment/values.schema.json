@@ -29,8 +29,8 @@
     },
     "replicas": {
       "type": "integer",
-      "minimum": 1,
-      "description": "Desired number of InferenceSet replicas. MUST be at least 1."
+      "minimum": 0,
+      "description": "Desired number of InferenceSet replicas, or the lower bound when autoscaling is enabled. May be zero for scale-to-zero."
     },
     "enableScaling": {
       "type": "boolean",
@@ -58,7 +58,7 @@
           "items": {
             "type": "object",
             "additionalProperties": true,
-            "required": ["name", "upThreshold", "downThreshold"],
+            "required": ["name"],
             "properties": {
               "name": {
                 "type": "string",
@@ -70,6 +70,11 @@
                 "enum": ["gauge", "histogram"],
                 "description": "Aggregation applied to the metric: gauge -> per-replica average; histogram -> per-pod windowed average (rolling _sum/_count delta over metricCacheWindow). Rendered as the `type` field of a scaledobject.kaito.sh/metrics entry. Defaults to gauge."
               },
+              "source": {
+                "type": "string",
+                "enum": ["", "modelpod", "epp"],
+                "description": "Metric scrape source. Empty preserves the scaler default; activation metrics use epp so they remain observable at zero replicas."
+              },
               "upThreshold": {
                 "type": ["string", "number"],
                 "description": "Per-replica scale-up threshold (float). REQUIRED when enableScaling is true: chart-defaulted per metric (10 for queue depth, 30 for queue time), and a fail-fast template guard rejects the install when it is explicitly set empty. MUST be strictly greater than downThreshold (also enforced by the template guard). Rendered as the `upthreshold` field of a scaledobject.kaito.sh/metrics entry."
@@ -77,6 +82,14 @@
               "downThreshold": {
                 "type": ["string", "number"],
                 "description": "Per-replica scale-down threshold (float). MUST be strictly less than upThreshold. REQUIRED when enableScaling is true: chart-defaulted to 1, and a fail-fast template guard rejects the install when it is explicitly set empty. Rendered as the `downthreshold` field of a scaledobject.kaito.sh/metrics entry."
+              },
+              "activationThreshold": {
+                "type": ["string", "number"],
+                "description": "Optional scale-from-zero activation threshold. Requires deactivationThreshold and source=epp."
+              },
+              "deactivationThreshold": {
+                "type": ["string", "number"],
+                "description": "Optional zero-edge deactivation threshold. May be supplied alone; it is required when activationThreshold is supplied."
               },
               "metricCacheWindow": {
                 "type": ["string", "number"],
@@ -99,6 +112,11 @@
           "type": "integer",
           "minimum": 1,
           "description": "Minimum seconds between scale-down steps. Wired to scaledobject.kaito.sh/scaledowncooldown."
+        },
+        "cooldownPeriod": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "KEDA idle cooldown in seconds. Zero omits scaledobject.kaito.sh/cooldownperiod and inherits the default."
         }
       }
     },
@@ -201,6 +219,17 @@
           "minimum": 1,
           "maximum": 65535,
           "description": "EPP HTTP metrics port."
+        },
+        "flowControl": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "EPP flow-control configuration used for scale-from-zero queueing.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enables the EPP flowControl feature gate and supporting metric plugins."
+            }
+          }
         }
       }
     },

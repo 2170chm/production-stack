@@ -144,6 +144,11 @@ type ModelDeploymentValues struct {
 	// that case (the chart rejects an empty metrics list). Each entry's
 	// UpThreshold MUST be strictly greater than its DownThreshold.
 	ScalingMetrics []ScalingMetric
+	// CooldownPeriod is KEDA's idle cooldown in seconds. Zero inherits the
+	// scaler default.
+	CooldownPeriod int64
+	// EPPFlowControl enables the EPP queue used as a scale-from-zero signal.
+	EPPFlowControl bool
 	// AutoUpgrade opts the InferenceSet into KAITO automatic base image
 	// upgrades, wired onto the modeldeployment chart's autoUpgrade.* values
 	// (rendered as spec.autoUpgrade). Only rendered when Enabled is true.
@@ -192,12 +197,21 @@ type ScalingMetric struct {
 	// average) or "histogram" (per-pod windowed average) (metrics entry
 	// `type`). Empty defaults to gauge.
 	Type string
+	// Source selects the metric endpoint: "modelpod" or "epp". Empty
+	// preserves the scaler default.
+	Source string
 	// UpThreshold is the per-replica scale-up threshold (metrics entry
 	// `upthreshold`). Required; MUST be strictly greater than DownThreshold.
 	UpThreshold string
 	// DownThreshold is the per-replica scale-down threshold (metrics entry
 	// `downthreshold`). Required; MUST be strictly less than UpThreshold.
 	DownThreshold string
+	// ActivationThreshold is the EPP threshold that wakes a zero-replica
+	// deployment. It requires DeactivationThreshold and Source="epp".
+	ActivationThreshold string
+	// DeactivationThreshold is the zero-edge inactive threshold. Model-pod
+	// metrics may use it without an activation threshold.
+	DeactivationThreshold string
 	// MetricCacheWindow is the rolling cache window in seconds for histogram
 	// metrics (metrics entry `metriccachewindow`). Optional; ignored for gauge.
 	MetricCacheWindow string
@@ -220,16 +234,38 @@ func (v ModelDeploymentValues) Validate() error {
 	if len(v.ScalingMetrics) == 0 {
 		return fmt.Errorf("modeldeployment %q: EnableScaling requires at least one ScalingMetric", v.Name)
 	}
+	hasActivationMetric := false
+	hasModelPodDeactivationMetric := false
 	for i, m := range v.ScalingMetrics {
 		if m.Name == "" {
 			return fmt.Errorf("modeldeployment %q: ScalingMetrics[%d].Name is required", v.Name, i)
 		}
-		if m.UpThreshold == "" {
-			return fmt.Errorf("modeldeployment %q: ScalingMetrics[%d] (%s) UpThreshold is required", v.Name, i, m.Name)
+		hasUp := m.UpThreshold != ""
+		hasDown := m.DownThreshold != ""
+		if hasUp != hasDown {
+			return fmt.Errorf("modeldeployment %q: ScalingMetrics[%d] (%s) UpThreshold and DownThreshold must be supplied together", v.Name, i, m.Name)
 		}
-		if m.DownThreshold == "" {
-			return fmt.Errorf("modeldeployment %q: ScalingMetrics[%d] (%s) DownThreshold is required", v.Name, i, m.Name)
+		if v.Replicas > 0 && !hasUp {
+			return fmt.Errorf("modeldeployment %q: ScalingMetrics[%d] (%s) UpThreshold and DownThreshold are required when Replicas is greater than zero", v.Name, i, m.Name)
 		}
+		if m.ActivationThreshold != "" {
+			if m.DeactivationThreshold == "" {
+				return fmt.Errorf("modeldeployment %q: ScalingMetrics[%d] (%s) ActivationThreshold requires DeactivationThreshold", v.Name, i, m.Name)
+			}
+			if m.Source != "epp" {
+				return fmt.Errorf("modeldeployment %q: ScalingMetrics[%d] (%s) ActivationThreshold requires Source=epp", v.Name, i, m.Name)
+			}
+			hasActivationMetric = true
+		}
+		if m.Source == "modelpod" && m.DeactivationThreshold != "" {
+			hasModelPodDeactivationMetric = true
+		}
+	}
+	if v.Replicas == 0 && !hasActivationMetric {
+		return fmt.Errorf("modeldeployment %q: scale-to-zero requires at least one EPP activation metric", v.Name)
+	}
+	if v.Replicas == 0 && !hasModelPodDeactivationMetric {
+		return fmt.Errorf("modeldeployment %q: scale-to-zero requires at least one modelpod deactivation metric", v.Name)
 	}
 	return nil
 }

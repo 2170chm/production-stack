@@ -302,6 +302,39 @@ func TestInstallModelDeploymentMapsValues(t *testing.T) {
 	}
 }
 
+func TestInstallModelDeploymentMapsScaleToZero(t *testing.T) {
+	d, calls := newTestDeployer(t, nil)
+	values := deploy.ModelDeploymentValues{
+		Name: "phi", Namespace: "e2e-ns", Model: "phi-4-mini-instruct",
+		Replicas: 0, EnableScaling: true, MaxReplicas: 1, CooldownPeriod: 60,
+		EPPFlowControl: true,
+		ScalingMetrics: []deploy.ScalingMetric{
+			{Name: "llm_d_epp_flow_control_queue_size", Type: "gauge", Source: "epp", ActivationThreshold: "0", DeactivationThreshold: "0"},
+			{Name: "vllm:num_requests_running", Type: "gauge", Source: "modelpod", DeactivationThreshold: "0"},
+		},
+	}
+
+	if err := d.InstallModelDeployment(context.Background(), values); err != nil {
+		t.Fatalf("InstallModelDeployment: %v", err)
+	}
+	args := (*calls)[0]
+	for _, want := range []string{
+		"replicas=0", "maxReplicas=1", "scaling.metrics[0].source=epp",
+		"scaling.metrics[0].activationThreshold=0", "scaling.metrics[0].deactivationThreshold=0",
+		"scaling.metrics[1].source=modelpod", "scaling.metrics[1].deactivationThreshold=0",
+		"scaling.cooldownPeriod=60", "epp.flowControl.enabled=true",
+	} {
+		if !hasArg(args, want) {
+			t.Errorf("missing --set %q in %v", want, args)
+		}
+	}
+	for _, prefix := range []string{"scaling.metrics[0].upThreshold=", "scaling.metrics[1].upThreshold="} {
+		if _, found := argValue(args, "--set", prefix); found {
+			t.Errorf("empty optional threshold was rendered: %v", args)
+		}
+	}
+}
+
 func TestInstallValidatesBeforeInvokingHelm(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -326,10 +359,26 @@ func TestInstallValidatesBeforeInvokingHelm(t *testing.T) {
 		{
 			name: "metric without thresholds",
 			values: deploy.ModelDeploymentValues{
-				Name: "phi", Model: "phi", EnableScaling: true,
+				Name: "phi", Model: "phi", Replicas: 1, EnableScaling: true,
 				ScalingMetrics: []deploy.ScalingMetric{{Name: "vllm:num_requests_waiting"}},
 			},
-			wantErr: "UpThreshold is required",
+			wantErr: "UpThreshold and DownThreshold are required",
+		},
+		{
+			name: "zero without activation metric",
+			values: deploy.ModelDeploymentValues{
+				Name: "phi", Model: "phi", EnableScaling: true,
+				ScalingMetrics: []deploy.ScalingMetric{{Name: "running", Source: "modelpod", DeactivationThreshold: "0"}},
+			},
+			wantErr: "requires at least one EPP activation metric",
+		},
+		{
+			name: "zero without modelpod deactivation metric",
+			values: deploy.ModelDeploymentValues{
+				Name: "phi", Model: "phi", EnableScaling: true,
+				ScalingMetrics: []deploy.ScalingMetric{{Name: "queue", Source: "epp", ActivationThreshold: "0", DeactivationThreshold: "0"}},
+			},
+			wantErr: "requires at least one modelpod deactivation metric",
 		},
 	}
 
