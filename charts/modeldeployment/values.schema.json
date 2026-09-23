@@ -58,7 +58,7 @@
         "metrics": {
           "type": "array",
           "minItems": 1,
-          "description": "Ordered list of scaling signals. Rendered as the scaledobject.kaito.sh/metrics annotation (a YAML list, one entry per metric). MUST contain at least one entry when enableScaling is true (also enforced by a fail-fast template guard).",
+          "description": "Ordered list of scaling signals. Defaults support scale-from-zero activation and normal positive-replica scaling. Rendered as the scaledobject.kaito.sh/metrics annotation (a YAML list, one entry per metric). MUST contain at least one entry when enableScaling is true (also enforced by a fail-fast template guard).",
           "items": {
             "type": "object",
             "additionalProperties": true,
@@ -81,11 +81,11 @@
               },
               "upThreshold": {
                 "type": ["string", "number"],
-                "description": "Per-replica scale-up threshold (float). REQUIRED when enableScaling is true: chart-defaulted per metric (10 for queue depth, 30 for queue time), and a fail-fast template guard rejects the install when it is explicitly set empty. MUST be strictly greater than downThreshold (also enforced by the template guard). Rendered as the `upthreshold` field of a scaledobject.kaito.sh/metrics entry."
+                "description": "Per-replica scale-up threshold (float). Must be supplied with downThreshold unless the metric is activation-only. MUST be strictly greater than downThreshold. Rendered as the `upthreshold` field of a scaledobject.kaito.sh/metrics entry."
               },
               "downThreshold": {
                 "type": ["string", "number"],
-                "description": "Per-replica scale-down threshold (float). MUST be strictly less than upThreshold. REQUIRED when enableScaling is true: chart-defaulted to 1, and a fail-fast template guard rejects the install when it is explicitly set empty. Rendered as the `downthreshold` field of a scaledobject.kaito.sh/metrics entry."
+                "description": "Per-replica scale-down threshold (float). Must be supplied with upThreshold unless the metric is activation-only. MUST be strictly less than upThreshold. Rendered as the `downthreshold` field of a scaledobject.kaito.sh/metrics entry."
               },
               "activationThreshold": {
                 "type": ["string", "number"],
@@ -223,17 +223,6 @@
           "minimum": 1,
           "maximum": 65535,
           "description": "EPP HTTP metrics port."
-        },
-        "flowControl": {
-          "type": "object",
-          "additionalProperties": false,
-          "description": "EPP flow-control configuration used for scale-from-zero queueing.",
-          "properties": {
-            "enabled": {
-              "type": "boolean",
-              "description": "Enables the EPP flowControl feature gate and supporting metric plugins."
-            }
-          }
         }
       }
     },

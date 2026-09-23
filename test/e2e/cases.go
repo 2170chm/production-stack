@@ -391,22 +391,6 @@ var CaseDeployments = map[string][]deploy.ModelDeploymentValues{
 			EnableScaling:  true,
 			MaxReplicas:    1,
 			CooldownPeriod: 60,
-			EPPFlowControl: true,
-			ScalingMetrics: []deploy.ScalingMetric{
-				{
-					Name:                  "llm_d_epp_flow_control_queue_size",
-					Type:                  "gauge",
-					Source:                "epp",
-					ActivationThreshold:   "0",
-					DeactivationThreshold: "0",
-				},
-				{
-					Name:                  "vllm:num_requests_running",
-					Type:                  "gauge",
-					Source:                "modelpod",
-					DeactivationThreshold: "0",
-				},
-			},
 		},
 	},
 	CaseKarpenterSmall: {

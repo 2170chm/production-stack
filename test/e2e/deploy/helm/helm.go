@@ -421,9 +421,6 @@ func setArgs(v deploy.ModelDeploymentValues) []string {
 			args = append(args, "--set", "scaling.cooldownPeriod="+strconv.FormatInt(v.CooldownPeriod, 10))
 		}
 	}
-	if v.EPPFlowControl {
-		args = append(args, "--set", "epp.flowControl.enabled=true")
-	}
 	if v.AutoUpgrade.Enabled {
 		args = append(args, "--set", "autoUpgrade.enabled=true")
 		if v.AutoUpgrade.MaintenanceWindowSchedule != "" {

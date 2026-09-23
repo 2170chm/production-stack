@@ -143,15 +143,13 @@ type ModelDeploymentValues struct {
 	MaxReplicas int64
 	// ScalingMetrics is the ordered list of composite scaling signals wired
 	// onto the modeldeployment chart's scaling.metrics[<i>] entries. Only
-	// used when EnableScaling is true; at least one entry is required in
-	// that case (the chart rejects an empty metrics list). Each entry's
+	// used when EnableScaling is true. Empty inherits the chart's default
+	// scale-to-zero and positive-replica metric policy. Each custom entry's
 	// UpThreshold MUST be strictly greater than its DownThreshold.
 	ScalingMetrics []ScalingMetric
 	// CooldownPeriod is KEDA's idle cooldown in seconds. Zero inherits the
 	// scaler default.
 	CooldownPeriod int64
-	// EPPFlowControl enables the EPP queue used as a scale-from-zero signal.
-	EPPFlowControl bool
 	// AutoUpgrade opts the InferenceSet into KAITO automatic base image
 	// upgrades, wired onto the modeldeployment chart's autoUpgrade.* values
 	// (rendered as spec.autoUpgrade). Only rendered when Enabled is true.
@@ -235,7 +233,7 @@ func (v ModelDeploymentValues) Validate() error {
 		return nil
 	}
 	if len(v.ScalingMetrics) == 0 {
-		return fmt.Errorf("modeldeployment %q: EnableScaling requires at least one ScalingMetric", v.Name)
+		return nil
 	}
 	hasActivationMetric := false
 	hasModelPodDeactivationMetric := false
@@ -248,9 +246,6 @@ func (v ModelDeploymentValues) Validate() error {
 		if hasUp != hasDown {
 			return fmt.Errorf("modeldeployment %q: ScalingMetrics[%d] (%s) UpThreshold and DownThreshold must be supplied together", v.Name, i, m.Name)
 		}
-		if v.Replicas > 0 && !hasUp {
-			return fmt.Errorf("modeldeployment %q: ScalingMetrics[%d] (%s) UpThreshold and DownThreshold are required when Replicas is greater than zero", v.Name, i, m.Name)
-		}
 		if m.ActivationThreshold != "" {
 			if m.DeactivationThreshold == "" {
 				return fmt.Errorf("modeldeployment %q: ScalingMetrics[%d] (%s) ActivationThreshold requires DeactivationThreshold", v.Name, i, m.Name)
@@ -259,6 +254,9 @@ func (v ModelDeploymentValues) Validate() error {
 				return fmt.Errorf("modeldeployment %q: ScalingMetrics[%d] (%s) ActivationThreshold requires Source=epp", v.Name, i, m.Name)
 			}
 			hasActivationMetric = true
+		}
+		if v.Replicas > 0 && !hasUp && m.ActivationThreshold == "" {
+			return fmt.Errorf("modeldeployment %q: ScalingMetrics[%d] (%s) requires UpThreshold/DownThreshold or ActivationThreshold when Replicas is greater than zero", v.Name, i, m.Name)
 		}
 		if m.Source == "modelpod" && m.DeactivationThreshold != "" {
 			hasModelPodDeactivationMetric = true

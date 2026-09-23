@@ -28,14 +28,14 @@ metadata:
     {{- if ne $hasUp $hasDown }}
     {{- fail (printf "modeldeployment: scaling.metrics[%d] must supply both upThreshold and downThreshold" $i) }}
     {{- end }}
-    {{- if and (gt ($.Values.replicas | int) 0) (not $hasUp) }}
-    {{- fail (printf "modeldeployment: scaling.metrics[%d] requires upThreshold and downThreshold when replicas is greater than zero" $i) }}
+    {{- $hasActivation := and (hasKey $m "activationThreshold") (ne (toString $m.activationThreshold) "") }}
+    {{- $hasDeactivation := and (hasKey $m "deactivationThreshold") (ne (toString $m.deactivationThreshold) "") }}
+    {{- if and (gt ($.Values.replicas | int) 0) (not $hasUp) (not $hasActivation) }}
+    {{- fail (printf "modeldeployment: scaling.metrics[%d] requires upThreshold/downThreshold or activationThreshold when replicas is greater than zero" $i) }}
     {{- end }}
     {{- if and $hasUp (not (gt (subf $m.upThreshold $m.downThreshold) 0.0)) }}
     {{- fail (printf "modeldeployment: scaling.metrics[%d].upThreshold (%v) must be greater than downThreshold (%v) when enableScaling is true" $i $m.upThreshold $m.downThreshold) }}
     {{- end }}
-    {{- $hasActivation := and (hasKey $m "activationThreshold") (ne (toString $m.activationThreshold) "") }}
-    {{- $hasDeactivation := and (hasKey $m "deactivationThreshold") (ne (toString $m.deactivationThreshold) "") }}
     {{- if and $hasActivation (not $hasDeactivation) }}
     {{- fail (printf "modeldeployment: scaling.metrics[%d].activationThreshold requires deactivationThreshold" $i) }}
     {{- end }}
