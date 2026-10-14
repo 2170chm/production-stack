@@ -71,7 +71,7 @@ var (
 	// minutes each.
 	GinkgoLabelScaling = g.Label("Scaling")
 
-	// GinkgoLabelScaleToZero marks the focused 0 <-> 1 activation path.
+	// GinkgoLabelScaleToZero marks the full 0 -> 1 -> 2 -> 1 -> 0 lifecycle.
 	GinkgoLabelScaleToZero = g.Label("ScaleToZero")
 
 	// GinkgoLabelFilterOrder marks tests that verify the Envoy HTTP

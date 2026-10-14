@@ -71,7 +71,7 @@ Labels live in [`utils/ginkgo.go`](utils/ginkgo.go) and fall into three groups:
   against real GPUs locally. The mocker needs a non-NVMe SKU: on NVMe SKUs KAITO stores weights
   on a local-NVMe PVC that a fake node cannot bind. The specs assert only traits common to both
   backends (model pods, Nodes, NodeClaims, vLLM metrics), never mocker internals.
-- **Feature area** (what a spec verifies): `Infra`, `Routing`, `PrefixCache`, `Perf` (prefix-cache load/perf, see [below](#prefix-cache-perf--load-test)), `Auth`, `CORS`, `NetworkPolicy`, `Scaling` (scale-up / scale-down / anti-flapping), `ScaleToZero` (focused `0 <-> 1` activation), `InferenceSet`, `FilterOrder`, `Karpenter`, `Outage` (fail-closed / HA resilience).
+- **Feature area** (what a spec verifies): `Infra`, `Routing`, `PrefixCache`, `Perf` (prefix-cache load/perf, see [below](#prefix-cache-perf--load-test)), `Auth`, `CORS`, `NetworkPolicy`, `Scaling` (scale-up / scale-down / anti-flapping), `ScaleToZero` (full `0 -> 1 -> 2 -> 1 -> 0` lifecycle), `InferenceSet`, `FilterOrder`, `Karpenter`, `Outage` (fail-closed / HA resilience).
 - **Environment** (what kind of cluster a spec needs): `StandardK8sOnly`.
 
 `ModelDiscovery` marks the `/v1/models` listing, retrieval, and authentication

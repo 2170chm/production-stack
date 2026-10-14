@@ -29,6 +29,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	"github.com/kaito-project/production-stack/test/e2e/deploy"
 	"github.com/kaito-project/production-stack/test/e2e/utils"
@@ -81,6 +82,9 @@ const (
 
 	// Margin applied on top of the KEDA-derived Eventually timeouts.
 	scalingEndpointTimeout = 1 * time.Minute
+
+	scaleToZeroProvisioningMargin  = 2 * time.Minute
+	scaleToZeroColdLoadConcurrency = 16
 
 	// scalingVLLMConfigName is the KAITO inference ConfigMap CaseScaling
 	// references; installScalingCase creates it before the InferenceSet.
@@ -136,14 +140,16 @@ var _ = Describe("InferenceSet Scaling — Infra",
 			keda utils.KEDAParams
 		}
 
-		Describe("Scale-Up → Scale-Down End-to-End",
-			Ordered, func() {
+		Describe("Scale 0 → 1 → 2 → 1 → 0 End-to-End",
+			Ordered, utils.GinkgoLabelScaleToZero, func() {
 
 				var (
 					ctx      context.Context
 					base     baseline
 					bulkLoad *utils.LoadGenerator
 					lowLoad  *utils.LoadGenerator
+					coldLoad *utils.LoadGenerator
+					parked   bool
 					// State carried across Its.
 					newPod string
 					// Every model pod seen during the flow → its node, and
@@ -156,16 +162,82 @@ var _ = Describe("InferenceSet Scaling — Infra",
 
 				BeforeAll(func() {
 					ctx = context.Background()
+					values := scalingValues
+					values.MinReplicas = 0
+					values.CooldownPeriod = 60
+					values.ScalingMetrics = slices.Clone(values.ScalingMetrics)
+					values.ScalingMetrics[0].Source = "modelpod"
+					values.ScalingMetrics[0].DeactivationThreshold = "0"
+					values.ScalingMetrics = append(values.ScalingMetrics,
+						deploy.ScalingMetric{
+							Name: "llm_d_epp_flow_control_queue_size", Type: "gauge", Source: "epp",
+							ActivationThreshold: "10", DeactivationThreshold: "0",
+						},
+						deploy.ScalingMetric{Name: "vllm:num_requests_running", Type: "gauge", Source: "modelpod", DeactivationThreshold: "0"},
+					)
+					Expect(utils.UpgradeModelDeployment(ctx, values)).To(Succeed())
+					Eventually(func(g Gomega) {
+						dynClient, err := utils.GetDynamicClient()
+						g.Expect(err).NotTo(HaveOccurred())
+						scaledObject, err := dynClient.Resource(utils.ScaledObjectGVR).Namespace(scalingNamespace).
+							Get(ctx, scalingModel, metav1.GetOptions{})
+						g.Expect(err).NotTo(HaveOccurred())
+						minReplicas, found, err := unstructured.NestedInt64(scaledObject.Object, "spec", "minReplicaCount")
+						g.Expect(err).NotTo(HaveOccurred())
+						g.Expect(found).To(BeTrue())
+						g.Expect(minReplicas).To(Equal(int64(0)))
+						maxReplicas, found, err := unstructured.NestedInt64(scaledObject.Object, "spec", "maxReplicaCount")
+						g.Expect(err).NotTo(HaveOccurred())
+						g.Expect(found).To(BeTrue())
+						g.Expect(maxReplicas).To(Equal(int64(2)))
+						g.Expect(scaledObjectReady(scaledObject.Object)).To(BeTrue())
+					}, 2*time.Minute, 5*time.Second).Should(Succeed())
+					var err error
+					base.keda, err = utils.GetKEDAParams(ctx, scalingModel, scalingNamespace)
+					Expect(err).NotTo(HaveOccurred())
+				})
+
+				It("parks the warm model and releases its GPU NodeClaim while EPP stays ready", func() {
+					Eventually(func() (int32, error) {
+						return utils.GetInferenceSetReplicas(ctx, scalingModel, scalingNamespace)
+					}, base.keda.ScaleDownTotalWait+base.keda.CooldownPeriod+scaleToZeroProvisioningMargin, 5*time.Second).
+						Should(Equal(int32(0)))
+					expectReadyModelPods(ctx, scalingValues, 0, scalingPodRemovalTimeout)
+					Expect(assertEPPReady(ctx, scalingNamespace, scalingModel)).To(Succeed())
+					expectNoNewNodeClaims(ctx, nodeClaimsBeforeInstall, scalingNodeRemovalTimeout)
+				})
+
+				It("wakes from sustained EPP demand and serves traffic at one replica", func() {
+					coldLoad = &utils.LoadGenerator{
+						Gateway: gateway, Model: scalingModel, Prompt: "hello",
+						Concurrency: scaleToZeroColdLoadConcurrency, MaxTokens: scalingMaxTokens,
+					}
+					coldLoad.Start(ctx)
+					Eventually(func() (int32, error) {
+						return utils.GetInferenceSetReplicas(ctx, scalingModel, scalingNamespace)
+					}, base.keda.ScaleUpTotalWait+scaleToZeroProvisioningMargin, 5*time.Second).Should(Equal(int32(1)))
+					Eventually(func(g Gomega) {
+						replicas, err := utils.GetInferenceSetReplicas(ctx, scalingModel, scalingNamespace)
+						g.Expect(err).NotTo(HaveOccurred())
+						if replicas == 0 {
+							StopTrying("InferenceSet parked during cold-start provisioning").Now()
+						}
+						g.Expect(utils.WaitForInferenceSetReady(ctx, scalingValues, 10*time.Second)).To(Succeed())
+					}, scalingProvisionTimeout, 5*time.Second).Should(Succeed())
+					Eventually(func() int64 {
+						return coldLoad.Stats().Success
+					}, 2*time.Minute, time.Second).Should(BeNumerically(">", 0))
+					coldLoad.Stop()
+					stats := coldLoad.Stats()
+					GinkgoWriter.Printf("cold-start load: %+v\n", stats)
+					Expect(stats.Errors5xx).To(BeNumerically("<=", 3*scaleToZeroColdLoadConcurrency), "cold-start load: %+v", stats)
+					Expect(utils.CheckChatSuccess(ctx, gateway, scalingModel, utils.WithMaxTokens(scalingMaxTokens))).To(Succeed())
+				})
+
+				It("records the reactivated baseline before adding capacity", func() {
+					ctx = context.Background()
 					var err error
 
-					// The outer BeforeAll installs the CaseScaling
-					// InferenceSet via the modeldeployment Helm chart at
-					// Replicas=MinReplicas=1 with EnableScaling=true, so KEDA's
-					// ScaledObject and the baseline pool are already in
-					// place by the time we run. We only need to read the
-					// effective KEDA params and record the baseline
-					// placement — no replica patching, no warm-up — see
-					// cases.go::CaseScaling for the source of truth.
 					By("Reading effective KEDA parameters from the ScaledObject")
 					base.keda, err = utils.GetKEDAParams(ctx, scalingModel, scalingNamespace)
 					Expect(err).NotTo(HaveOccurred(),
@@ -182,8 +254,8 @@ var _ = Describe("InferenceSet Scaling — Infra",
 					By("Capturing baseline replicas and model pod placement")
 					base.replicas, err = utils.GetInferenceSetReplicas(ctx, scalingModel, scalingNamespace)
 					Expect(err).NotTo(HaveOccurred())
-					Expect(base.replicas).To(BeNumerically(">=", 1),
-						"BeforeAll must have installed %s with replicas>=1", scalingModel)
+					Expect(base.replicas).To(Equal(int32(1)),
+						"cold-start activation must leave %s at one replica", scalingModel)
 					GinkgoWriter.Printf("Baseline replicas for %s: %d\n", scalingModel, base.replicas)
 
 					base.pods = expectReadyModelPods(ctx, scalingValues, int(base.replicas), scalingEndpointTimeout)
@@ -215,6 +287,9 @@ var _ = Describe("InferenceSet Scaling — Infra",
 				})
 
 				AfterAll(func() {
+					if coldLoad != nil {
+						coldLoad.Stop()
+					}
 					if bulkLoad != nil {
 						bulkLoad.Stop()
 					}
@@ -225,7 +300,7 @@ var _ = Describe("InferenceSet Scaling — Infra",
 					// replica count, restore it so subsequent suites (or
 					// the Anti-Flapping Describe) start from the same
 					// baseline the chart installed.
-					if base.replicas <= 0 {
+					if base.replicas <= 0 || parked {
 						return
 					}
 					By("Restoring baseline replicas")
@@ -556,6 +631,18 @@ var _ = Describe("InferenceSet Scaling — Infra",
 					Expect(stats.Total).To(BeNumerically(">", 0),
 						"low-rate generator must have issued some requests")
 				})
+
+				It("returns to zero and releases GPU NodeClaims after all work clears", func() {
+					lowLoad.Stop()
+					Eventually(func() (int32, error) {
+						return utils.GetInferenceSetReplicas(ctx, scalingModel, scalingNamespace)
+					}, base.keda.ScaleDownTotalWait+base.keda.CooldownPeriod+scaleToZeroProvisioningMargin, 5*time.Second).
+						Should(Equal(int32(0)))
+					expectReadyModelPods(ctx, scalingValues, 0, scalingPodRemovalTimeout)
+					Expect(assertEPPReady(ctx, scalingNamespace, scalingModel)).To(Succeed())
+					expectNoNewNodeClaims(ctx, nodeClaimsBeforeInstall, scalingNodeRemovalTimeout)
+					parked = true
+				})
 			},
 		)
 
@@ -570,6 +657,16 @@ var _ = Describe("InferenceSet Scaling — Infra",
 					keda       utils.KEDAParams
 				}
 			)
+
+			BeforeAll(func() {
+				ctx = context.Background()
+				Expect(utils.UpgradeModelDeployment(ctx, scalingValues)).To(Succeed())
+				Expect(utils.SetInferenceSetReplicas(ctx, scalingModel, scalingNamespace, 1)).To(Succeed())
+				Expect(utils.WaitForInferenceSetReady(ctx, scalingValues, scalingProvisionTimeout)).To(Succeed())
+				Eventually(func() error {
+					return utils.CheckChatSuccess(ctx, gateway, scalingModel, utils.WithMaxTokens(scalingMaxTokens))
+				}, scalingProvisionTimeout, 10*time.Second).Should(Succeed())
+			})
 
 			BeforeEach(func() {
 				ctx = context.Background()
@@ -900,4 +997,42 @@ func isNodeReady(node *corev1.Node) bool {
 		}
 	}
 	return false
+}
+
+func scaledObjectReady(object map[string]interface{}) bool {
+	conditions, found, err := unstructured.NestedSlice(object, "status", "conditions")
+	if err != nil || !found {
+		return false
+	}
+	for _, condition := range conditions {
+		fields, ok := condition.(map[string]interface{})
+		if ok && fields["type"] == "Ready" && fields["status"] == "True" {
+			return true
+		}
+	}
+	return false
+}
+
+func assertEPPReady(ctx context.Context, namespace, modelName string) error {
+	clientset, err := utils.GetK8sClientset()
+	if err != nil {
+		return err
+	}
+	eppName := utils.EPPServiceName(modelName)
+	deployment, err := clientset.AppsV1().Deployments(namespace).Get(ctx, eppName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if deployment.Status.ReadyReplicas < 1 {
+		return fmt.Errorf("EPP Deployment %s/%s has no ready replicas", namespace, eppName)
+	}
+	selector := "inferencepool=" + eppName
+	pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		return err
+	}
+	if len(utils.ReadyPods(pods.Items)) > 0 {
+		return nil
+	}
+	return fmt.Errorf("no Running/Ready EPP pod matches %q; matching pods=%v", selector, pods.Items)
 }

@@ -225,13 +225,13 @@ failures can be localised.
 * Below-threshold stability — Hold `vllm:num_requests_waiting` strictly below the KEDA threshold for the full polling + cooldown window. Verify `InferenceSet.spec.replicas` does **not** change, no model pod outside the baseline appears, and no new NodeClaim is created. Guards against false-positive scale-ups from noisy metrics.
 * Cooldown respected — Immediately after a Scale-Down completes, re-apply queue pressure above the threshold. Verify the next Scale-Up does **not** fire until the ScaledObject's cooldown has elapsed and that no intermediate scale oscillations are observed. Flapping is the top production pain point for autoscalers and must be explicitly pinned.
 
-### Scale To Zero — Focused Happy Path
+### Scale To Zero — Full Scaling Lifecycle
 
 **CI tier:** same jobs as the Scaling group (`make test-e2e-scaling`). Run alone with `E2E_LABEL='ScaleToZero && StandardK8sOnly' E2E_PARALLEL=1`.
 
-Warm-bootstrap one replica (GPU-mocked or real H100) with EPP flow control enabled, then upgrade the same release to a zero-minimum, one-maximum ScaledObject. Verify the idle model parks at zero while a Ready EPP remains discoverable through its canonical `inferencepool` label. Sustained authenticated requests must activate one replica and hold it through provisioning; cold requests may fail. After readiness, a fresh request must return HTTP 200 with the requested model, and the deployment must return to zero after demand clears.
+Warm-bootstrap one replica (GPU-mocked or real H100), then upgrade the same release to a zero-minimum, two-maximum ScaledObject with EPP flow control. Verify the idle model parks and releases its GPU NodeClaim while EPP remains Ready. Sustained authenticated requests must wake one replica and keep it through provisioning; cold-start delivery is best effort, with eventual success and bounded 5xx responses.
 
-This scenario intentionally excludes the `1 <-> N` inventory assertions already covered above; teardown fails if a NodeClaim created during the spec outlives it.
+On that same deployment, run the Scale-Up and Scale-Down assertions above: queue pressure, replica increase, new GPU node and NodeClaim, routing to the new pod, queue drain, replica decrease, inventory cleanup, and no 5xx during the two-to-one transition. A low-rate stream keeps the remaining replica active. Stop that stream, verify the deployment returns to zero, and verify all case-created NodeClaims are released while EPP remains Ready. Anti-flapping runs separately after restoring a one-replica minimum.
 
 ## Unknown model / malformed request handling — Routing
 
