@@ -24,7 +24,6 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
@@ -50,6 +49,8 @@ var _ = Describe("InferenceSet Scale To Zero",
 			coldLoad  *utils.LoadGenerator
 			namespace string
 			modelName string
+
+			nodeClaimsBeforeInstall []string
 		)
 
 		BeforeAll(func() {
@@ -57,7 +58,7 @@ var _ = Describe("InferenceSet Scale To Zero",
 			values = CaseDeployments[CaseScaleToZero][0]
 			namespace, modelName = values.Namespace, values.Name
 
-			nodeClaimsBeforeInstall := snapshotNodeClaimNames(ctx)
+			nodeClaimsBeforeInstall = snapshotNodeClaimNames(ctx)
 			Expect(utils.EnsureNamespace(ctx, namespace)).To(Succeed())
 			DeferCleanup(func() {
 				if coldLoad != nil {
@@ -116,11 +117,12 @@ var _ = Describe("InferenceSet Scale To Zero",
 				pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: values.InferencePodSelector()})
 				g.Expect(err).NotTo(HaveOccurred())
 				for _, pod := range pods.Items {
-					g.Expect(podReady(&pod)).To(BeFalse(), "model pod %s remains Ready at zero replicas", pod.Name)
+					g.Expect(utils.IsPodReady(pod)).To(BeFalse(), "model pod %s remains Ready at zero replicas", pod.Name)
 				}
 			}, keda.ScaleDownTotalWait+keda.CooldownPeriod+scaleToZeroProvisioningMargin, 5*time.Second).Should(Succeed())
 
 			Expect(assertEPPReady(ctx, namespace, modelName)).To(Succeed())
+			expectNoNewNodeClaims(ctx, nodeClaimsBeforeInstall, scalingNodeRemovalTimeout)
 		})
 
 		It("activates from sustained EPP demand and serves traffic", func() {
@@ -137,14 +139,20 @@ var _ = Describe("InferenceSet Scale To Zero",
 			Eventually(func(g Gomega) {
 				replicas, err := utils.GetInferenceSetReplicas(ctx, modelName, namespace)
 				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(replicas).To(Equal(int32(1)), "replicas returned to zero during provisioning")
+				if replicas == 0 {
+					StopTrying("InferenceSet parked while cold-start requests were held in the EPP queue").Now()
+				}
 				g.Expect(utils.WaitForInferenceSetReady(ctx, values, 10*time.Second)).To(Succeed())
 			}, scalingProvisionTimeout, 5*time.Second).Should(Succeed())
 
+			Eventually(func() int64 {
+				return coldLoad.Stats().Success
+			}, 2*time.Minute, time.Second).Should(BeNumerically(">", 0), "no cold-start request was served after wake-up")
 			coldLoad.Stop()
 			stats := coldLoad.Stats()
 			GinkgoWriter.Printf("cold-start load: %+v\n", stats)
-			Expect(stats.Total).To(BeNumerically(">", 0))
+			// Tolerates a few EPP/EDS race losses per worker
+			Expect(stats.Errors5xx).To(BeNumerically("<=", 3*scaleToZeroColdLoadConcurrency), "cold-start load: %+v", stats)
 
 			response, err := utils.SendChatContext(ctx, gateway, modelName, utils.WithMaxTokens(scalingMaxTokens))
 			Expect(err).NotTo(HaveOccurred())
@@ -159,6 +167,7 @@ var _ = Describe("InferenceSet Scale To Zero",
 				return utils.GetInferenceSetReplicas(ctx, modelName, namespace)
 			}, keda.ScaleDownTotalWait+keda.CooldownPeriod+scaleToZeroProvisioningMargin, 5*time.Second).Should(Equal(int32(0)))
 			Expect(assertEPPReady(ctx, namespace, modelName)).To(Succeed())
+			expectNoNewNodeClaims(ctx, nodeClaimsBeforeInstall, scalingNodeRemovalTimeout)
 		})
 	})
 
@@ -194,19 +203,8 @@ func assertEPPReady(ctx context.Context, namespace, modelName string) error {
 	if err != nil {
 		return err
 	}
-	for i := range pods.Items {
-		if pods.Items[i].Status.Phase == corev1.PodRunning && podReady(&pods.Items[i]) {
-			return nil
-		}
+	if len(utils.ReadyPods(pods.Items)) > 0 {
+		return nil
 	}
 	return fmt.Errorf("no Running/Ready EPP pod matches %q; matching pods=%v", selector, pods.Items)
-}
-
-func podReady(pod *corev1.Pod) bool {
-	for _, condition := range pod.Status.Conditions {
-		if condition.Type == corev1.PodReady {
-			return condition.Status == corev1.ConditionTrue
-		}
-	}
-	return false
 }
