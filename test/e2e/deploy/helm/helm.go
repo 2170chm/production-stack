@@ -387,6 +387,9 @@ func setArgs(v deploy.ModelDeploymentValues) []string {
 	if v.Config != "" {
 		args = append(args, "--set-string", "config="+v.Config)
 	}
+	if v.DisableBenchmark {
+		args = append(args, "--set", "enableBenchmark=false")
+	}
 	if v.EnableScaling {
 		args = append(args, "--set", "enableScaling=true")
 		args = append(args,

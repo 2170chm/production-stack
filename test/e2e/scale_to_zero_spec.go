@@ -34,9 +34,13 @@ import (
 
 const scaleToZeroProvisioningMargin = 2 * time.Minute
 
+// scaleToZeroColdLoadConcurrency keeps more requests held in the EPP queue
+// than the chart's default activationThreshold (10) so the pool wakes.
+const scaleToZeroColdLoadConcurrency = 16
+
 var _ = Describe("InferenceSet Scale To Zero",
 	Ordered, utils.GinkgoLabelScaling, utils.GinkgoLabelScaleToZero,
-	utils.GinkgoLabelNightly, utils.GinkgoLabelStandardK8sOnly, func() {
+	utils.GinkgoLabelStandardK8sOnly, func() {
 
 		var (
 			ctx       context.Context
@@ -53,12 +57,17 @@ var _ = Describe("InferenceSet Scale To Zero",
 			values = CaseDeployments[CaseScaleToZero][0]
 			namespace, modelName = values.Namespace, values.Name
 
+			nodeClaimsBeforeInstall := snapshotNodeClaimNames(ctx)
 			Expect(utils.EnsureNamespace(ctx, namespace)).To(Succeed())
 			DeferCleanup(func() {
 				if coldLoad != nil {
 					coldLoad.Stop()
 				}
-				Expect(utils.CleanupDeploymentsAndNamespace(context.Background(), []deploy.ModelDeploymentValues{values}, namespace)).To(Succeed())
+				// Wait for leaked NodeClaims even if the namespace cleanup
+				// failed, so a GPU node is never silently left behind.
+				cleanupErr := utils.CleanupDeploymentsAndNamespace(context.Background(), []deploy.ModelDeploymentValues{values}, namespace)
+				expectNoNewNodeClaims(context.Background(), nodeClaimsBeforeInstall, scalingNodeRemovalTimeout)
+				Expect(cleanupErr).To(Succeed())
 			})
 
 			var err error
@@ -69,10 +78,10 @@ var _ = Describe("InferenceSet Scale To Zero",
 			warmValues.Replicas = 1
 			warmValues.EnableScaling = false
 			Expect(utils.InstallModelDeployment(ctx, warmValues)).To(Succeed())
-			Expect(utils.WaitForInferenceSetReady(ctx, warmValues, utils.InferenceSetReadyTimeout)).To(Succeed())
+			Expect(utils.WaitForInferenceSetReady(ctx, warmValues, scalingProvisionTimeout)).To(Succeed())
 			Eventually(func() error {
-				return utils.CheckChatSuccess(ctx, gateway, modelName)
-			}, utils.InferenceSetReadyTimeout, 10*time.Second).Should(Succeed())
+				return utils.CheckChatSuccess(ctx, gateway, modelName, utils.WithMaxTokens(scalingMaxTokens))
+			}, scalingProvisionTimeout, 10*time.Second).Should(Succeed())
 
 			Expect(utils.UpgradeModelDeployment(ctx, values)).To(Succeed())
 			Eventually(func(g Gomega) {
@@ -116,7 +125,8 @@ var _ = Describe("InferenceSet Scale To Zero",
 
 		It("activates from sustained EPP demand and serves traffic", func() {
 			coldLoad = &utils.LoadGenerator{
-				Gateway: gateway, Model: modelName, Prompt: "hello", Concurrency: 2,
+				Gateway: gateway, Model: modelName, Prompt: "hello", Concurrency: scaleToZeroColdLoadConcurrency,
+				MaxTokens: scalingMaxTokens,
 			}
 			coldLoad.Start(ctx)
 
@@ -129,14 +139,14 @@ var _ = Describe("InferenceSet Scale To Zero",
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(replicas).To(Equal(int32(1)), "replicas returned to zero during provisioning")
 				g.Expect(utils.WaitForInferenceSetReady(ctx, values, 10*time.Second)).To(Succeed())
-			}, utils.InferenceSetReadyTimeout, 5*time.Second).Should(Succeed())
+			}, scalingProvisionTimeout, 5*time.Second).Should(Succeed())
 
 			coldLoad.Stop()
 			stats := coldLoad.Stats()
 			GinkgoWriter.Printf("cold-start load: %+v\n", stats)
 			Expect(stats.Total).To(BeNumerically(">", 0))
 
-			response, err := utils.SendChatContext(ctx, gateway, modelName)
+			response, err := utils.SendChatContext(ctx, gateway, modelName, utils.WithMaxTokens(scalingMaxTokens))
 			Expect(err).NotTo(HaveOccurred())
 			Expect(response.StatusCode).To(Equal(http.StatusOK))
 			parsed, err := utils.ParseChatCompletionResponse(response)

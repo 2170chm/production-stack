@@ -53,6 +53,9 @@ E2E_LABEL=PrefixCache make test-e2e
 E2E_LABEL=ScaleToZero E2E_PARALLEL=1 make test-e2e
 E2E_LABEL=Smoke make test-e2e
 
+# Scaling specs (Scaling label: 1<->2 and 0<->1), serial, 240m budget
+make test-e2e-scaling
+
 # Override parallelism
 E2E_PARALLEL=4 make test-e2e
 ```
@@ -60,6 +63,14 @@ E2E_PARALLEL=4 make test-e2e
 Labels live in [`utils/ginkgo.go`](utils/ginkgo.go) and fall into three groups:
 
 - **Cadence** (when a spec runs): `Smoke` (every PR), `Nightly` (long-running, nightly only).
+  `Scaling` specs are excluded from the main runs (`!Nightly && !Perf && !Scaling`) and run
+  through `make test-e2e-scaling`: on the GPU mocker (`Standard_NV36ads_A10_v5`) in the daily
+  upstream job, and on real `Standard_NC40ads_H100_v5` nodes (Karpenter/NAP, australiaeast) in
+  the nightly `e2e-nightly-scaling-tests` job, which sets
+  `E2E_SCALING_INSTANCE_TYPE=Standard_NC40ads_H100_v5`. Set the same variable when running
+  against real GPUs locally. The mocker needs a non-NVMe SKU: on NVMe SKUs KAITO stores weights
+  on a local-NVMe PVC that a fake node cannot bind. The specs assert only traits common to both
+  backends (model pods, Nodes, NodeClaims, vLLM metrics), never mocker internals.
 - **Feature area** (what a spec verifies): `Infra`, `Routing`, `PrefixCache`, `Perf` (prefix-cache load/perf, see [below](#prefix-cache-perf--load-test)), `Auth`, `CORS`, `NetworkPolicy`, `Scaling` (scale-up / scale-down / anti-flapping), `ScaleToZero` (focused `0 <-> 1` activation), `InferenceSet`, `FilterOrder`, `Karpenter`, `Outage` (fail-closed / HA resilience).
 - **Environment** (what kind of cluster a spec needs): `StandardK8sOnly`.
 

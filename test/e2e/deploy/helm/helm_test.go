@@ -284,6 +284,9 @@ func TestInstallModelDeploymentMapsValues(t *testing.T) {
 	if !hasArg(args, "epp.scorerWeights.prefixCache=0") {
 		t.Errorf("zero-valued prefixCache weight was dropped: %v", args)
 	}
+	if _, found := argValue(args, "--set", "enableBenchmark="); found {
+		t.Errorf("enableBenchmark must inherit the chart default unless DisableBenchmark is set: %v", args)
+	}
 	// kvCacheUtilization was nil and must fall through to the chart default.
 	if _, found := argValue(args, "--set", "epp.scorerWeights.kvCacheUtilization="); found {
 		t.Errorf("nil kvCacheUtilization must not be rendered: %v", args)
@@ -312,7 +315,8 @@ func TestInstallModelDeploymentMapsScaleToZero(t *testing.T) {
 	d, calls := newTestDeployer(t, nil)
 	values := deploy.ModelDeploymentValues{
 		Name: "phi", Namespace: "e2e-ns", Model: "phi-4-mini-instruct",
-		Replicas: 0, EnableScaling: true, MaxReplicas: 1, CooldownPeriod: 60,
+		Replicas: 1, EnableScaling: true, MinReplicas: 0, MaxReplicas: 1, CooldownPeriod: 60,
+		DisableBenchmark: true,
 	}
 
 	if err := d.InstallModelDeployment(context.Background(), values); err != nil {
@@ -320,7 +324,7 @@ func TestInstallModelDeploymentMapsScaleToZero(t *testing.T) {
 	}
 	args := (*calls)[0]
 	for _, want := range []string{
-		"replicas=0", "maxReplicas=1", "scaling.cooldownPeriod=60",
+		"replicas=1", "minReplicas=0", "maxReplicas=1", "scaling.cooldownPeriod=60", "enableBenchmark=false",
 	} {
 		if !hasArg(args, want) {
 			t.Errorf("missing --set %q in %v", want, args)
@@ -350,15 +354,30 @@ func TestInstallValidatesBeforeInvokingHelm(t *testing.T) {
 		{
 			name: "metric without thresholds",
 			values: deploy.ModelDeploymentValues{
-				Name: "phi", Model: "phi", Replicas: 1, EnableScaling: true,
+				Name: "phi", Model: "phi", EnableScaling: true, MinReplicas: 1, MaxReplicas: 2,
 				ScalingMetrics: []deploy.ScalingMetric{{Name: "vllm:num_requests_waiting"}},
 			},
-			wantErr: "requires UpThreshold/DownThreshold or ActivationThreshold",
+			wantErr: "requires UpThreshold/DownThreshold, ActivationThreshold or DeactivationThreshold",
+		},
+		{
+			name: "positive minReplicas with only zero-edge metrics",
+			values: deploy.ModelDeploymentValues{
+				Name: "phi", Model: "phi", EnableScaling: true, MinReplicas: 1, MaxReplicas: 2,
+				ScalingMetrics: []deploy.ScalingMetric{{Name: "queue", Source: "epp", ActivationThreshold: "0", DeactivationThreshold: "0"}},
+			},
+			wantErr: "requires at least one metric with UpThreshold/DownThreshold",
+		},
+		{
+			name: "cooldown with positive minReplicas",
+			values: deploy.ModelDeploymentValues{
+				Name: "phi", Model: "phi", EnableScaling: true, MinReplicas: 1, MaxReplicas: 2, CooldownPeriod: 60,
+			},
+			wantErr: "CooldownPeriod requires MinReplicas=0",
 		},
 		{
 			name: "zero without activation metric",
 			values: deploy.ModelDeploymentValues{
-				Name: "phi", Model: "phi", EnableScaling: true,
+				Name: "phi", Model: "phi", EnableScaling: true, MaxReplicas: 1,
 				ScalingMetrics: []deploy.ScalingMetric{{Name: "running", Source: "modelpod", DeactivationThreshold: "0"}},
 			},
 			wantErr: "requires at least one EPP activation metric",
@@ -366,7 +385,7 @@ func TestInstallValidatesBeforeInvokingHelm(t *testing.T) {
 		{
 			name: "zero without modelpod deactivation metric",
 			values: deploy.ModelDeploymentValues{
-				Name: "phi", Model: "phi", EnableScaling: true,
+				Name: "phi", Model: "phi", EnableScaling: true, MaxReplicas: 1,
 				ScalingMetrics: []deploy.ScalingMetric{{Name: "queue", Source: "epp", ActivationThreshold: "0", DeactivationThreshold: "0"}},
 			},
 			wantErr: "requires at least one modelpod deactivation metric",

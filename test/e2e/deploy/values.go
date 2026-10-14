@@ -151,9 +151,12 @@ type ModelDeploymentValues struct {
 	// scale-to-zero and positive-replica metric policy. Each custom entry's
 	// UpThreshold MUST be strictly greater than its DownThreshold.
 	ScalingMetrics []ScalingMetric
-	// CooldownPeriod is KEDA's idle cooldown in seconds. Zero inherits the
-	// scaler default.
+	// CooldownPeriod is KEDA's idle cooldown in seconds before parking at
+	// zero. Only valid with MinReplicas=0; zero keeps the chart default.
 	CooldownPeriod int64
+	// DisableBenchmark sets enableBenchmark=false so KAITO skips its
+	// post-load benchmark. Zero value keeps the chart default (enabled).
+	DisableBenchmark bool
 	// AutoUpgrade opts the InferenceSet into KAITO automatic base image
 	// upgrades, wired onto the modeldeployment chart's autoUpgrade.* values
 	// (rendered as spec.autoUpgrade). Only rendered when Enabled is true.
@@ -236,11 +239,25 @@ func (v ModelDeploymentValues) Validate() error {
 	if !v.EnableScaling {
 		return nil
 	}
+	if v.MinReplicas < 0 {
+		return fmt.Errorf("modeldeployment %q: MinReplicas must not be negative (got %d)", v.Name, v.MinReplicas)
+	}
+	if v.MaxReplicas < 1 {
+		return fmt.Errorf("modeldeployment %q: EnableScaling requires MaxReplicas >= 1 (got %d)", v.Name, v.MaxReplicas)
+	}
+	if v.MaxReplicas < v.MinReplicas {
+		return fmt.Errorf("modeldeployment %q: MaxReplicas (%d) must be >= MinReplicas (%d)", v.Name, v.MaxReplicas, v.MinReplicas)
+	}
+	// The chart silently ignores cooldownPeriod unless minReplicas is 0.
+	if v.MinReplicas > 0 && v.CooldownPeriod > 0 {
+		return fmt.Errorf("modeldeployment %q: CooldownPeriod requires MinReplicas=0", v.Name)
+	}
 	if len(v.ScalingMetrics) == 0 {
 		return nil
 	}
 	hasActivationMetric := false
 	hasModelPodDeactivationMetric := false
+	hasScalingMetric := false
 	for i, m := range v.ScalingMetrics {
 		if m.Name == "" {
 			return fmt.Errorf("modeldeployment %q: ScalingMetrics[%d].Name is required", v.Name, i)
@@ -259,27 +276,25 @@ func (v ModelDeploymentValues) Validate() error {
 			}
 			hasActivationMetric = true
 		}
-		if v.Replicas > 0 && !hasUp && m.ActivationThreshold == "" {
-			return fmt.Errorf("modeldeployment %q: ScalingMetrics[%d] (%s) requires UpThreshold/DownThreshold or ActivationThreshold when Replicas is greater than zero", v.Name, i, m.Name)
+		if !hasUp && m.ActivationThreshold == "" && m.DeactivationThreshold == "" {
+			return fmt.Errorf("modeldeployment %q: ScalingMetrics[%d] (%s) requires UpThreshold/DownThreshold, ActivationThreshold or DeactivationThreshold", v.Name, i, m.Name)
+		}
+		if hasUp {
+			hasScalingMetric = true
 		}
 		if m.Source == "modelpod" && m.DeactivationThreshold != "" {
 			hasModelPodDeactivationMetric = true
 		}
 	}
-	if v.Replicas == 0 && !hasActivationMetric {
+	// The chart drops zero-edge-only metrics when MinReplicas > 0.
+	if v.MinReplicas > 0 && !hasScalingMetric {
+		return fmt.Errorf("modeldeployment %q: MinReplicas > 0 requires at least one metric with UpThreshold/DownThreshold", v.Name)
+	}
+	if v.MinReplicas == 0 && !hasActivationMetric {
 		return fmt.Errorf("modeldeployment %q: scale-to-zero requires at least one EPP activation metric", v.Name)
 	}
-	if v.Replicas == 0 && !hasModelPodDeactivationMetric {
+	if v.MinReplicas == 0 && !hasModelPodDeactivationMetric {
 		return fmt.Errorf("modeldeployment %q: scale-to-zero requires at least one modelpod deactivation metric", v.Name)
-	}
-	if v.MinReplicas < 0 {
-		return fmt.Errorf("modeldeployment %q: MinReplicas must not be negative (got %d)", v.Name, v.MinReplicas)
-	}
-	if v.MaxReplicas < 1 {
-		return fmt.Errorf("modeldeployment %q: EnableScaling requires MaxReplicas >= 1 (got %d)", v.Name, v.MaxReplicas)
-	}
-	if v.MaxReplicas < v.MinReplicas {
-		return fmt.Errorf("modeldeployment %q: MaxReplicas (%d) must be >= MinReplicas (%d)", v.Name, v.MaxReplicas, v.MinReplicas)
 	}
 	return nil
 }
