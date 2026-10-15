@@ -140,6 +140,8 @@ jobs:
       CLUSTER_NAME: "kaito-ns-aks-${{ github.run_id }}-${{ github.run_attempt }}"
       ACR_NAME: "kaitons${{ github.run_id }}a${{ github.run_attempt }}acr"
       LOCATION: australiaeast
+      E2E_MODEL_STREAMING: 'true'
+      E2E_MODEL_STREAMING_NAMESPACE: e2e-scaling
 
     steps:
       - name: Checkout Repository

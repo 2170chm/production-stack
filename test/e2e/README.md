@@ -67,8 +67,10 @@ Labels live in [`utils/ginkgo.go`](utils/ginkgo.go) and fall into three groups:
   through `make test-e2e-scaling`: on the GPU mocker (`Standard_NV36ads_A10_v5`) in the daily
   upstream job, and on real `Standard_NC40ads_H100_v5` nodes (Karpenter/NAP, australiaeast) in
   the nightly `e2e-nightly-scaling-tests` job, which sets
-  `E2E_SCALING_INSTANCE_TYPE=Standard_NC40ads_H100_v5`. Set the same variable when running
-  against real GPUs locally. The mocker needs a non-NVMe SKU: on NVMe SKUs KAITO stores weights
+  `E2E_SCALING_INSTANCE_TYPE=Standard_NC40ads_H100_v5`. That job also sets
+  `E2E_MODEL_STREAMING=true` and `E2E_MODEL_STREAMING_NAMESPACE=e2e-scaling`:
+  component setup provisions keyless Blob CSI storage and workload identity and then enables
+  ModelMirror and ModelStreaming.
   on a local-NVMe PVC that a fake node cannot bind. The specs assert only traits common to both
   backends (model pods, Nodes, NodeClaims, vLLM metrics), never mocker internals.
 - **Feature area** (what a spec verifies): `Infra`, `Routing`, `PrefixCache`, `Perf` (prefix-cache load/perf, see [below](#prefix-cache-perf--load-test)), `Auth`, `CORS`, `NetworkPolicy`, `Scaling` (scale-up / scale-down / anti-flapping), `ScaleToZero` (full `0 -> 1 -> 2 -> 1 -> 0` lifecycle), `InferenceSet`, `FilterOrder`, `Karpenter`, `Outage` (fail-closed / HA resilience).

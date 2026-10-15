@@ -127,6 +127,71 @@ prepare_managed_kaito_crds() {
   KAITO_HELM_ARGS+=(--skip-crds)
 }
 
+prepare_model_streaming() {
+  local namespace="${E2E_MODEL_STREAMING_NAMESPACE:?Set E2E_MODEL_STREAMING_NAMESPACE}"
+  local storage_class="kaito-model-mirror"
+  local service_account="kaito-model-streamer"
+  local identity_name="kaito-model-streamer"
+  local storage_account identity_client_id identity_principal_id storage_scope oidc_issuer control_plane_id
+  local subscription="${AZURE_SUBSCRIPTION_ID:?Set AZURE_SUBSCRIPTION_ID}"
+  storage_account="kaitomm$(printf '%s' "${CLUSTER_NAME}" | openssl dgst -sha256 | awk '{print substr($NF,1,16)}')"
+
+  echo "=== Preparing ModelMirror and ModelStreaming (${namespace}) ==="
+  az aks update --subscription "${subscription}" \
+    --resource-group "${RESOURCE_GROUP}" --name "${CLUSTER_NAME}" \
+    --enable-blob-driver --enable-oidc-issuer --enable-workload-identity \
+    --yes --only-show-errors --output none
+  az storage account create --subscription "${subscription}" \
+    --resource-group "${RESOURCE_GROUP}" --name "${storage_account}" \
+    --location "${LOCATION}" --sku Premium_LRS --kind BlockBlobStorage \
+    --https-only true --allow-shared-key-access false --output none
+  az identity create --subscription "${subscription}" \
+    --resource-group "${RESOURCE_GROUP}" --name "${identity_name}" --output none
+  identity_client_id=$(az identity show --subscription "${subscription}" \
+    --resource-group "${RESOURCE_GROUP}" --name "${identity_name}" --query clientId --output tsv)
+  identity_principal_id=$(az identity show --subscription "${subscription}" \
+    --resource-group "${RESOURCE_GROUP}" --name "${identity_name}" --query principalId --output tsv)
+  storage_scope="/subscriptions/${subscription}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Storage/storageAccounts/${storage_account}"
+  az role assignment create --subscription "${subscription}" \
+    --assignee-object-id "${identity_principal_id}" --assignee-principal-type ServicePrincipal \
+    --role "Storage Blob Data Contributor" --scope "${storage_scope}" --output none
+  control_plane_id=$(az aks show --subscription "${subscription}" \
+    --resource-group "${RESOURCE_GROUP}" --name "${CLUSTER_NAME}" --query identity.principalId --output tsv)
+  az role assignment create --subscription "${subscription}" \
+    --assignee-object-id "${control_plane_id}" --assignee-principal-type ServicePrincipal \
+    --role "Storage Account Contributor" --scope "${storage_scope}" --output none
+  oidc_issuer=$(az aks show --subscription "${subscription}" \
+    --resource-group "${RESOURCE_GROUP}" --name "${CLUSTER_NAME}" --query oidcIssuerProfile.issuerUrl --output tsv)
+  az identity federated-credential create --subscription "${subscription}" \
+    --resource-group "${RESOURCE_GROUP}" --identity-name "${identity_name}" \
+    --name model-streaming --issuer "${oidc_issuer}" \
+    --subject "system:serviceaccount:${namespace}:${service_account}" \
+    --audiences api://AzureADTokenExchange --output none
+
+  kubectl create namespace "${namespace}" --dry-run=client --output yaml | kubectl apply -f -
+  kubectl create serviceaccount "${service_account}" --namespace "${namespace}" \
+    --dry-run=client --output yaml | kubectl apply -f -
+  kubectl annotate serviceaccount "${service_account}" --namespace "${namespace}" \
+    "azure.workload.identity/client-id=${identity_client_id}" --overwrite
+  jq -n --arg name "${storage_class}" --arg rg "${RESOURCE_GROUP}" \
+    --arg account "${storage_account}" --arg client "${identity_client_id}" '{
+      apiVersion: "storage.k8s.io/v1", kind: "StorageClass", metadata: {name: $name},
+      provisioner: "blob.csi.azure.com", allowVolumeExpansion: true, reclaimPolicy: "Delete",
+      parameters: {resourceGroup: $rg, storageAccount: $account, protocol: "fuse2",
+        skuName: "Premium_LRS", clientID: $client, mountWithWorkloadIdentityToken: "true"},
+      mountOptions: ["-o allow_other", "--block-cache", "--block-cache-block-size=16",
+        "--block-cache-pool-size=8192", "--block-cache-prefetch=11"]
+    }' | kubectl apply -f -
+  kubectl rollout status daemonset/csi-blob-node --namespace kube-system --timeout=300s
+
+  KAITO_HELM_ARGS+=(
+    --set featureGates.ModelMirror=true
+    --set featureGates.ModelStreaming=true
+    --set "defaultModelMirrorStorageClass=${storage_class}"
+    --set "defaultStreamingServiceAccount=${service_account}"
+  )
+}
+
 install_kaito() {
   echo "=== Installing KAITO workspace operator (image: nightly-latest) ==="
 
@@ -139,6 +204,9 @@ install_kaito() {
 
   KAITO_HELM_ARGS=()
   run_provider_hook prepare_kaito_crds
+  if [[ "${E2E_MODEL_STREAMING:-false}" == "true" ]]; then
+    prepare_model_streaming
+  fi
 
   # Per-model GAIE artifacts are provisioned by charts/modeldeployment; enabling
   # the gate would render a duplicate set of resources via Flux and conflict.
