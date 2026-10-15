@@ -127,34 +127,55 @@ prepare_managed_kaito_crds() {
   KAITO_HELM_ARGS+=(--skip-crds)
 }
 
+retry_azure_identity_not_found() {
+  local attempt output exit_code
+  for attempt in 1 2 3 4 5 6; do
+    if output=$(az "$@" --only-show-errors 2>&1); then
+      printf '%s\n' "${output}"
+      return 0
+    else
+      exit_code=$?
+    fi
+    printf '%s\n' "${output}" >&2
+    if ! grep -Eq '^ERROR: \((Resource)?NotFound\)' <<< "${output}" || [[ "${attempt}" == 6 ]]; then
+      return "${exit_code}"
+    fi
+    echo "Identity operation not yet available (attempt ${attempt}/6); retrying in $((attempt * 10))s..." >&2
+    sleep "$((attempt * 10))"
+  done
+}
+
 prepare_model_streaming() {
   local namespace="${E2E_MODEL_STREAMING_NAMESPACE:?Set E2E_MODEL_STREAMING_NAMESPACE}"
   local storage_class="kaito-model-mirror"
   local service_account="kaito-model-streamer"
   local identity_name="kaito-model-streamer"
-  local storage_account identity_client_id identity_principal_id storage_scope oidc_issuer control_plane_id
+  local storage_account identity_json identity_client_id identity_principal_id storage_scope oidc_issuer control_plane_id
   local subscription="${AZURE_SUBSCRIPTION_ID:?Set AZURE_SUBSCRIPTION_ID}"
   storage_account="kaitomm$(printf '%s' "${CLUSTER_NAME}" | openssl dgst -sha256 | awk '{print substr($NF,1,16)}')"
 
   echo "=== Preparing ModelMirror and ModelStreaming (${namespace}) ==="
+  echo "  Enabling Blob CSI, OIDC issuer, and workload identity"
   az aks update --subscription "${subscription}" \
     --resource-group "${RESOURCE_GROUP}" --name "${CLUSTER_NAME}" \
     --enable-blob-driver --enable-oidc-issuer --enable-workload-identity \
     --yes --only-show-errors --output none
+  echo "  Creating model mirror storage account ${storage_account}"
   az storage account create --subscription "${subscription}" \
     --resource-group "${RESOURCE_GROUP}" --name "${storage_account}" \
     --location "${LOCATION}" --sku Premium_LRS --kind BlockBlobStorage \
     --https-only true --allow-shared-key-access false --output none
-  az identity create --subscription "${subscription}" \
-    --resource-group "${RESOURCE_GROUP}" --name "${identity_name}" --output none
-  identity_client_id=$(az identity show --subscription "${subscription}" \
-    --resource-group "${RESOURCE_GROUP}" --name "${identity_name}" --query clientId --output tsv)
-  identity_principal_id=$(az identity show --subscription "${subscription}" \
-    --resource-group "${RESOURCE_GROUP}" --name "${identity_name}" --query principalId --output tsv)
+  echo "  Creating streaming identity ${identity_name}"
+  identity_json=$(retry_azure_identity_not_found identity create --subscription "${subscription}" \
+    --resource-group "${RESOURCE_GROUP}" --name "${identity_name}" --output json)
+  identity_client_id=$(jq -er '.clientId | select(type == "string" and length > 0)' <<< "${identity_json}")
+  identity_principal_id=$(jq -er '.principalId | select(type == "string" and length > 0)' <<< "${identity_json}")
   storage_scope="/subscriptions/${subscription}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Storage/storageAccounts/${storage_account}"
+  echo "  Granting streaming identity access to model blobs"
   az role assignment create --subscription "${subscription}" \
     --assignee-object-id "${identity_principal_id}" --assignee-principal-type ServicePrincipal \
     --role "Storage Blob Data Contributor" --scope "${storage_scope}" --output none
+  echo "  Granting AKS control-plane identity access to the storage account"
   control_plane_id=$(az aks show --subscription "${subscription}" \
     --resource-group "${RESOURCE_GROUP}" --name "${CLUSTER_NAME}" --query identity.principalId --output tsv)
   az role assignment create --subscription "${subscription}" \
@@ -162,12 +183,14 @@ prepare_model_streaming() {
     --role "Storage Account Contributor" --scope "${storage_scope}" --output none
   oidc_issuer=$(az aks show --subscription "${subscription}" \
     --resource-group "${RESOURCE_GROUP}" --name "${CLUSTER_NAME}" --query oidcIssuerProfile.issuerUrl --output tsv)
-  az identity federated-credential create --subscription "${subscription}" \
+  echo "  Creating streaming federated credential for ${namespace}/${service_account}"
+  retry_azure_identity_not_found identity federated-credential create --subscription "${subscription}" \
     --resource-group "${RESOURCE_GROUP}" --identity-name "${identity_name}" \
     --name model-streaming --issuer "${oidc_issuer}" \
     --subject "system:serviceaccount:${namespace}:${service_account}" \
     --audiences api://AzureADTokenExchange --output none
 
+  echo "  Configuring streaming service account and storage class"
   kubectl create namespace "${namespace}" --dry-run=client --output yaml | kubectl apply -f -
   kubectl create serviceaccount "${service_account}" --namespace "${namespace}" \
     --dry-run=client --output yaml | kubectl apply -f -
