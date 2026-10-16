@@ -62,8 +62,9 @@ const (
 	// down-threshold=1 and scale-down converges back to the baseline.
 	scalingSubThresholdConcurrency = 4
 
-	// Rate of the background low-rate stream used for "no 5xx during scale-down".
-	scalingLowRate = 1.0 // requests per second
+	// Longer, back-to-back generations keep the pool active during scale-down
+	// without filling the five running slots or building a waiting queue.
+	scalingBackgroundMaxTokens = 1024
 
 	// Bounds every completion so request latency on a real GPU stays short
 	// and the load shape matches the simulator's.
@@ -275,13 +276,13 @@ var _ = Describe("InferenceSet Scaling — Infra",
 						"InferenceSet %s readyReplicas must reach %d or KEDA cannot scale up; "+
 							"check the child Workspace WorkspaceSucceeded condition", scalingModel, base.replicas)
 
-					By("Starting low-rate background stream for the scale-down transition window")
+					By("Starting one continuous background worker with long responses for the scale-down transition window")
 					lowLoad = &utils.LoadGenerator{
-						Gateway:   gateway,
-						Model:     scalingModel,
-						Prompt:    "hi",
-						Rate:      scalingLowRate,
-						MaxTokens: scalingMaxTokens,
+						Gateway:     gateway,
+						Model:       scalingModel,
+						Prompt:      "Write a detailed tutorial about how computers work, covering processors, memory, storage, networking, and operating systems. Explain each topic thoroughly with examples and continue for at least 1500 words.",
+						Concurrency: 1,
+						MaxTokens:   scalingBackgroundMaxTokens,
 					}
 					lowLoad.Start(ctx)
 				})
@@ -490,7 +491,7 @@ var _ = Describe("InferenceSet Scaling — Infra",
 						stats.Total, stats.Success, stats.Errors5xx, stats.OtherNon2xx, stats.TransportErr)
 
 					By("Waiting for vllm:num_requests_waiting == 0 on every Ready model pod")
-					// We don't wait for running==0 because lowLoad keeps 1 req/s running.
+					// The background worker continues generating while the waiting queue drains.
 					Eventually(func(g Gomega) {
 						snap, err := utils.ScrapeModelPodMetric(ctx, clientset, scalingValues, "vllm:num_requests_waiting")
 						g.Expect(err).NotTo(HaveOccurred())
@@ -621,15 +622,15 @@ var _ = Describe("InferenceSet Scaling — Infra",
 						"at least one remaining pod should serve traffic, diff=%+v", diff)
 				})
 
-				It("G2: low-rate stream saw no 5xx during the scale-down transition", func() {
+				It("G2: continuous background stream saw no 5xx during the scale-down transition", func() {
 					stats := lowLoad.Stats()
-					GinkgoWriter.Printf("Low-rate stats across scale-down window: %+v\n", stats)
+					GinkgoWriter.Printf("Continuous background stats across scale-down window: %+v\n", stats)
 					Expect(stats.Errors5xx).To(BeNumerically("==", 0),
-						"background low-rate stream must not observe any 5xx, stats=%+v", stats)
+						"continuous background stream must not observe any 5xx, stats=%+v", stats)
 
 					// Allow a handful of transport-level reconnects; be strict about server errors.
-					Expect(stats.Total).To(BeNumerically(">", 0),
-						"low-rate generator must have issued some requests")
+					Expect(stats.Success).To(BeNumerically(">", 0),
+						"background worker must have completed successful requests, stats=%+v", stats)
 				})
 
 				It("returns to zero and releases GPU NodeClaims after all work clears", func() {

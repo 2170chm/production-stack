@@ -218,7 +218,7 @@ failures can be localised.
 * Excess pod, NodeClaim, and node cleaned up — Every model pod seen during scale-up that is no longer current is gone, and each node that no longer hosts a model pod has its NodeClaim and then its Node removed. Which replica KAITO removes is nondeterministic, so identity is not asserted.
 * Ready model pods shrink — Verify the Ready model-pod count returns to the baseline replica count.
 * Remaining pods continue to serve traffic — Resume sending requests. Verify all requests succeed (HTTP 200). Scrape `vllm:request_success_total` on the remaining pods to confirm they handle the load. `inference_extension_scheduler_attempts_total{status="failure"}` must not increment.
-* No request failures during transition — Send a low-rate stream of requests throughout the scale-down window. Verify `inference_objective_request_error_total` does not increment and no HTTP 5xx responses are observed. Proves the system handles pod removal gracefully without dropping in-flight requests.
+* No request failures during transition — Send back-to-back long-response requests with one concurrent worker throughout the scale-down window. Verify successful responses and no HTTP 5xx responses are observed. Proves the system handles pod removal gracefully without dropping in-flight requests.
 
 ### Anti-Flapping
 
@@ -231,7 +231,7 @@ failures can be localised.
 
 Warm-bootstrap one replica (GPU-mocked or real H100), then upgrade the same release to a zero-minimum, two-maximum ScaledObject with EPP flow control. Verify the idle model parks and releases its GPU NodeClaim while EPP remains Ready. Sustained authenticated requests must wake one replica and keep it through provisioning; cold-start delivery is best effort, with eventual success and bounded 5xx responses.
 
-On that same deployment, run the Scale-Up and Scale-Down assertions above: queue pressure, replica increase, new GPU node and NodeClaim, routing to the new pod, queue drain, replica decrease, inventory cleanup, and no 5xx during the two-to-one transition. A low-rate stream keeps the remaining replica active. Stop that stream, verify the deployment returns to zero, and verify all case-created NodeClaims are released while EPP remains Ready. Anti-flapping runs separately after restoring a one-replica minimum.
+On that same deployment, run the Scale-Up and Scale-Down assertions above: queue pressure, replica increase, new GPU node and NodeClaim, routing to the new pod, queue drain, replica decrease, inventory cleanup, and no 5xx during the two-to-one transition. A single background worker sends back-to-back long-response requests (up to 1,024 tokens each) to keep the remaining replica active without building a waiting queue. Stop that worker, verify the deployment returns to zero, and verify all case-created NodeClaims are released while EPP remains Ready. Anti-flapping runs separately after restoring a one-replica minimum.
 
 ## Unknown model / malformed request handling — Routing
 
