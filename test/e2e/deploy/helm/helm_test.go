@@ -343,6 +343,42 @@ func TestInstallModelDeploymentMapsScaleToZero(t *testing.T) {
 	}
 }
 
+func TestUpgradeModelDeploymentEnablesCapacityWithoutRemovingZeroScaling(t *testing.T) {
+	d, calls := newTestDeployer(t, nil)
+	values := deploy.ModelDeploymentValues{
+		Name: "phi", Namespace: "e2e-ns", Model: "phi-4-mini-instruct",
+		Replicas: 1, EnableScaling: true, MinReplicas: 0, MaxReplicas: 1, CooldownPeriod: 60,
+		InitialCooldownPeriod: ptr.To(int64(60)),
+		ScalingMetrics: []deploy.ScalingMetric{
+			{Name: "vllm:num_requests_waiting", Type: "gauge", Source: "modelpod", UpThreshold: "3", DownThreshold: "1", DeactivationThreshold: "0"},
+			{Name: "llm_d_epp_flow_control_queue_size", Type: "gauge", Source: "epp", ActivationThreshold: "10", DeactivationThreshold: "0"},
+			{Name: "vllm:num_requests_running", Type: "gauge", Source: "modelpod", DeactivationThreshold: "0"},
+		},
+	}
+	for _, maximum := range []int64{1, 2} {
+		values.MaxReplicas = maximum
+		if err := d.UpgradeModelDeployment(context.Background(), values); err != nil {
+			t.Fatalf("UpgradeModelDeployment (maxReplicas=%d): %v", maximum, err)
+		}
+		args := (*calls)[len(*calls)-1]
+		wantMaximum := "maxReplicas=1"
+		if maximum == 2 {
+			wantMaximum = "maxReplicas=2"
+		}
+		for _, want := range []string{
+			wantMaximum, "replicas=1", "minReplicas=0", "enableScaling=true",
+			"scaling.cooldownPeriod=60", "scaling.initialCooldownPeriod=60",
+			"scaling.metrics[0].upThreshold=3", "scaling.metrics[0].downThreshold=1",
+			"scaling.metrics[1].activationThreshold=10", "scaling.metrics[1].deactivationThreshold=0",
+			"scaling.metrics[2].name=vllm:num_requests_running", "scaling.metrics[2].deactivationThreshold=0",
+		} {
+			if !hasArg(args, want) {
+				t.Errorf("maxReplicas=%d: missing --set %q in %v", maximum, want, args)
+			}
+		}
+	}
+}
+
 func TestInstallValidatesBeforeInvokingHelm(t *testing.T) {
 	tests := []struct {
 		name    string

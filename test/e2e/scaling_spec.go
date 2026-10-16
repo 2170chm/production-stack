@@ -145,12 +145,13 @@ var _ = Describe("InferenceSet Scaling — Infra",
 			Ordered, utils.GinkgoLabelScaleToZero, func() {
 
 				var (
-					ctx      context.Context
-					base     baseline
-					bulkLoad *utils.LoadGenerator
-					lowLoad  *utils.LoadGenerator
-					coldLoad *utils.LoadGenerator
-					parked   bool
+					ctx             context.Context
+					base            baseline
+					bulkLoad        *utils.LoadGenerator
+					lowLoad         *utils.LoadGenerator
+					coldLoad        *utils.LoadGenerator
+					parked          bool
+					lifecycleValues deploy.ModelDeploymentValues
 					// State carried across Its.
 					newPod string
 					// Every model pod seen during the flow → its node, and
@@ -165,6 +166,7 @@ var _ = Describe("InferenceSet Scaling — Infra",
 					ctx = context.Background()
 					values := scalingValues
 					values.MinReplicas = 0
+					values.MaxReplicas = 1
 					values.CooldownPeriod = 60
 					initialCooldown := int64(60)
 					values.InitialCooldownPeriod = &initialCooldown
@@ -178,6 +180,7 @@ var _ = Describe("InferenceSet Scaling — Infra",
 						},
 						deploy.ScalingMetric{Name: "vllm:num_requests_running", Type: "gauge", Source: "modelpod", DeactivationThreshold: "0"},
 					)
+					lifecycleValues = values
 					Expect(utils.UpgradeModelDeployment(ctx, values)).To(Succeed())
 					Eventually(func(g Gomega) {
 						dynClient, err := utils.GetDynamicClient()
@@ -192,7 +195,7 @@ var _ = Describe("InferenceSet Scaling — Infra",
 						maxReplicas, found, err := unstructured.NestedInt64(scaledObject.Object, "spec", "maxReplicaCount")
 						g.Expect(err).NotTo(HaveOccurred())
 						g.Expect(found).To(BeTrue())
-						g.Expect(maxReplicas).To(Equal(int64(2)))
+						g.Expect(maxReplicas).To(Equal(int64(1)))
 						g.Expect(scaledObjectReady(scaledObject.Object)).To(BeTrue())
 					}, 2*time.Minute, 5*time.Second).Should(Succeed())
 					var err error
@@ -230,7 +233,53 @@ var _ = Describe("InferenceSet Scaling — Infra",
 					Eventually(func() int64 {
 						return coldLoad.Stats().Success
 					}, 2*time.Minute, time.Second).Should(BeNumerically(">", 0))
-					Expect(utils.CheckChatSuccess(ctx, gateway, scalingModel, utils.WithMaxTokens(scalingMaxTokens))).To(Succeed())
+
+					By("Starting one continuous background worker before stopping cold-start pressure")
+					lowLoad = &utils.LoadGenerator{
+						Gateway:     gateway,
+						Model:       scalingModel,
+						Prompt:      "Write a detailed tutorial about how computers work, covering processors, memory, storage, networking, and operating systems. Explain each topic thoroughly with examples and continue for at least 1500 words.",
+						Concurrency: 1,
+						MaxTokens:   scalingBackgroundMaxTokens,
+					}
+					lowLoad.Start(ctx)
+					coldLoad.Stop()
+					handoffStarted := time.Now()
+					stats := coldLoad.Stats()
+					GinkgoWriter.Printf("cold-start load through handoff: %+v\n", stats)
+					Expect(stats.Success).To(BeNumerically(">", 0))
+					Expect(stats.Errors5xx).To(BeNumerically("<=", 3*scaleToZeroColdLoadConcurrency), "cold-start load: %+v", stats)
+
+					clientset, err := utils.GetK8sClientset()
+					Expect(err).NotTo(HaveOccurred())
+					By("Draining cold-start backlog and verifying KEDA observes the background workload before probing")
+					Eventually(func(g Gomega) {
+						replicas, err := utils.GetInferenceSetReplicas(ctx, scalingModel, scalingNamespace)
+						g.Expect(err).NotTo(HaveOccurred())
+						if replicas == 0 {
+							StopTrying("InferenceSet parked during the cold-to-background load handoff").Now()
+						}
+						g.Expect(replicas).To(Equal(int32(1)))
+						g.Expect(lowLoad.Stats().Success).To(BeNumerically(">", 0))
+						waiting, err := utils.ScrapeModelPodMetric(ctx, clientset, scalingValues, "vllm:num_requests_waiting")
+						g.Expect(err).NotTo(HaveOccurred())
+						for pod, count := range waiting {
+							g.Expect(count).To(BeZero(), "cold-start backlog must drain on pod %s", pod)
+						}
+						dynClient, err := utils.GetDynamicClient()
+						g.Expect(err).NotTo(HaveOccurred())
+						so, err := dynClient.Resource(utils.ScaledObjectGVR).Namespace(scalingNamespace).
+							Get(ctx, scalingModel, metav1.GetOptions{})
+						g.Expect(err).NotTo(HaveOccurred())
+						lastActive, found, err := unstructured.NestedString(so.Object, "status", "lastActiveTime")
+						g.Expect(err).NotTo(HaveOccurred())
+						g.Expect(found).To(BeTrue(), "KEDA must record active demand")
+						activeAt, err := time.Parse(time.RFC3339, lastActive)
+						g.Expect(err).NotTo(HaveOccurred())
+						g.Expect(activeAt.After(handoffStarted)).To(BeTrue(),
+							"lastActiveTime=%s must advance after cold-start pressure stops", lastActive)
+						g.Expect(utils.CheckChatSuccess(ctx, gateway, scalingModel, utils.WithMaxTokens(scalingMaxTokens))).To(Succeed())
+					}, 2*time.Minute, 5*time.Second).Should(Succeed())
 				})
 
 				It("records the reactivated baseline before adding capacity", func() {
@@ -275,15 +324,6 @@ var _ = Describe("InferenceSet Scaling — Infra",
 						"InferenceSet %s readyReplicas must reach %d or KEDA cannot scale up; "+
 							"check the child Workspace WorkspaceSucceeded condition", scalingModel, base.replicas)
 
-					By("Starting one continuous background worker with long responses for the scale-down transition window")
-					lowLoad = &utils.LoadGenerator{
-						Gateway:     gateway,
-						Model:       scalingModel,
-						Prompt:      "Write a detailed tutorial about how computers work, covering processors, memory, storage, networking, and operating systems. Explain each topic thoroughly with examples and continue for at least 1500 words.",
-						Concurrency: 1,
-						MaxTokens:   scalingBackgroundMaxTokens,
-					}
-					lowLoad.Start(ctx)
 				})
 
 				AfterAll(func() {
@@ -320,31 +360,6 @@ var _ = Describe("InferenceSet Scaling — Infra",
 						MaxTokens:   scalingMaxTokens,
 					}
 					bulkLoad.Start(ctx)
-					handoffStarted := time.Now()
-					By("Keeping cold-start demand until KEDA observes active bulk traffic")
-					Eventually(func(g Gomega) {
-						replicas, err := utils.GetInferenceSetReplicas(ctx, scalingModel, scalingNamespace)
-						g.Expect(err).NotTo(HaveOccurred())
-						if replicas == 0 {
-							StopTrying("InferenceSet parked during the cold-to-bulk load handoff").Now()
-						}
-						dynClient, err := utils.GetDynamicClient()
-						g.Expect(err).NotTo(HaveOccurred())
-						so, err := dynClient.Resource(utils.ScaledObjectGVR).Namespace(scalingNamespace).
-							Get(ctx, scalingModel, metav1.GetOptions{})
-						g.Expect(err).NotTo(HaveOccurred())
-						lastActive, found, err := unstructured.NestedString(so.Object, "status", "lastActiveTime")
-						g.Expect(err).NotTo(HaveOccurred())
-						g.Expect(found).To(BeTrue(), "KEDA must record active demand")
-						activeAt, err := time.Parse(time.RFC3339, lastActive)
-						g.Expect(err).NotTo(HaveOccurred())
-						g.Expect(activeAt.After(handoffStarted)).To(BeTrue(), "lastActiveTime=%s must advance after bulk load starts", lastActive)
-					}, base.keda.ScaleUpTotalWait, 5*time.Second).Should(Succeed())
-					coldLoad.Stop()
-					stats := coldLoad.Stats()
-					GinkgoWriter.Printf("cold-start load through handoff: %+v\n", stats)
-					Expect(stats.Success).To(BeNumerically(">", 0))
-					Expect(stats.Errors5xx).To(BeNumerically("<=", 3*scaleToZeroColdLoadConcurrency), "cold-start load: %+v", stats)
 
 					clientset, err := utils.GetK8sClientset()
 					Expect(err).NotTo(HaveOccurred())
@@ -363,6 +378,27 @@ var _ = Describe("InferenceSet Scaling — Infra",
 						g.Expect(maxWaiting).To(BeNumerically(">", float64(base.keda.Threshold)),
 							"expected max num_requests_waiting > %d, saw %v", base.keda.Threshold, snap)
 					}, base.keda.PollingInterval+60*time.Second, 3*time.Second).Should(Succeed())
+
+					By("Allowing the second replica only after bulk queue pressure is established")
+					lifecycleValues.MaxReplicas = scalingValues.MaxReplicas
+					Expect(utils.UpgradeModelDeployment(ctx, lifecycleValues)).To(Succeed())
+					Eventually(func(g Gomega) {
+						replicas, err := utils.GetInferenceSetReplicas(ctx, scalingModel, scalingNamespace)
+						g.Expect(err).NotTo(HaveOccurred())
+						if replicas == 0 {
+							StopTrying("InferenceSet parked while enabling capacity scaling").Now()
+						}
+						dynClient, err := utils.GetDynamicClient()
+						g.Expect(err).NotTo(HaveOccurred())
+						so, err := dynClient.Resource(utils.ScaledObjectGVR).Namespace(scalingNamespace).
+							Get(ctx, scalingModel, metav1.GetOptions{})
+						g.Expect(err).NotTo(HaveOccurred())
+						maxReplicas, found, err := unstructured.NestedInt64(so.Object, "spec", "maxReplicaCount")
+						g.Expect(err).NotTo(HaveOccurred())
+						g.Expect(found).To(BeTrue())
+						g.Expect(maxReplicas).To(Equal(int64(scalingValues.MaxReplicas)))
+						g.Expect(scaledObjectReady(so.Object)).To(BeTrue())
+					}, 2*time.Minute, 5*time.Second).Should(Succeed())
 				})
 
 				It("A2: KEDA bumps InferenceSet.spec.replicas", func() {
