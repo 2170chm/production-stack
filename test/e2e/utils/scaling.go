@@ -61,8 +61,8 @@ type KEDAParams struct {
 	ScaleDownRatePeriod    time.Duration
 	ScaleUpStabilization   time.Duration
 	ScaleDownStabilization time.Duration
-	ScaleUpTotalWait       time.Duration // polling + upStabilization + margin
-	ScaleDownTotalWait     time.Duration // polling + downStabilization + margin
+	ScaleUpTotalWait       time.Duration // polling + max(stabilization, rate period) + margin
+	ScaleDownTotalWait     time.Duration // polling + max(stabilization, rate period) + margin
 }
 
 // GetKEDAParams fetches the ScaledObject managed for the given InferenceSet

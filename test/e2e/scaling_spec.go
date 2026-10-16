@@ -244,9 +244,10 @@ var _ = Describe("InferenceSet Scaling — Infra",
 					Expect(base.keda.Threshold).To(BeNumerically(">", 0),
 						"KEDA threshold must be set")
 					GinkgoWriter.Printf(
-						"KEDA params: threshold=%d polling=%s cooldown=%s upStab=%s downStab=%s "+
+						"KEDA params: threshold=%d polling=%s cooldown=%s initialCooldown=%s upPeriod=%s downPeriod=%s upStab=%s downStab=%s "+
 							"→ scaleUpWait=%s scaleDownWait=%s\n",
 						base.keda.Threshold, base.keda.PollingInterval, base.keda.CooldownPeriod,
+						base.keda.InitialCooldownPeriod, base.keda.ScaleUpRatePeriod, base.keda.ScaleDownRatePeriod,
 						base.keda.ScaleUpStabilization, base.keda.ScaleDownStabilization,
 						base.keda.ScaleUpTotalWait, base.keda.ScaleDownTotalWait)
 
@@ -668,7 +669,7 @@ var _ = Describe("InferenceSet Scaling — Infra",
 					lowLoad.Stop()
 					Eventually(func() (int32, error) {
 						return utils.GetInferenceSetReplicas(ctx, scalingModel, scalingNamespace)
-					}, base.keda.ScaleDownTotalWait+base.keda.CooldownPeriod+scaleToZeroProvisioningMargin, 5*time.Second).
+					}, base.keda.PollingInterval+base.keda.CooldownPeriod+scaleToZeroProvisioningMargin, 5*time.Second).
 						Should(Equal(int32(0)))
 					expectReadyModelPods(ctx, scalingValues, 0, scalingPodRemovalTimeout)
 					Expect(assertEPPReady(ctx, scalingNamespace, scalingModel)).To(Succeed())
@@ -720,7 +721,7 @@ var _ = Describe("InferenceSet Scaling — Infra",
 					context.Background(), scalingModel, scalingNamespace, base.replicas); err != nil {
 					GinkgoWriter.Printf("warning: restore replicas: %v\n", err)
 				}
-				// Passively wait one cooldown so the next case starts fresh.
+				// Let the HPA rate-limit policies expire before the next case.
 				// (Only pays the full window when a test actually caused a scale event.)
 				time.Sleep(max(base.keda.ScaleUpRatePeriod, base.keda.ScaleDownRatePeriod))
 			})
@@ -742,7 +743,7 @@ var _ = Describe("InferenceSet Scaling — Infra",
 				load.Start(ctx)
 				defer load.Stop()
 
-				observeWindow := base.keda.PollingInterval + base.keda.CooldownPeriod
+				observeWindow := max(base.keda.ScaleUpTotalWait, base.keda.ScaleDownTotalWait)
 				// Every 15s confirm that nothing scaled — replicas, model pods,
 				// and NodeClaims all stay at baseline — and track the queue.
 				sampleEvery := 15 * time.Second
