@@ -154,6 +154,11 @@ type ModelDeploymentValues struct {
 	// CooldownPeriod is KEDA's idle cooldown in seconds before parking at
 	// zero. Only valid with MinReplicas=0; zero keeps the chart default.
 	CooldownPeriod int64
+	// Nil inherits scaler defaults; pointers allow an explicit zero.
+	InitialCooldownPeriod        *int64
+	ScaleDownStabilizationWindow *int64
+	ScaleUpPeriodSeconds         *int64
+	ScaleDownPeriodSeconds       *int64
 	// DisableBenchmark sets enableBenchmark=false so KAITO skips its
 	// post-load benchmark. Zero value keeps the chart default (enabled).
 	DisableBenchmark bool
@@ -251,6 +256,22 @@ func (v ModelDeploymentValues) Validate() error {
 	// The chart silently ignores cooldownPeriod unless minReplicas is 0.
 	if v.MinReplicas > 0 && v.CooldownPeriod > 0 {
 		return fmt.Errorf("modeldeployment %q: CooldownPeriod requires MinReplicas=0", v.Name)
+	}
+	if v.InitialCooldownPeriod != nil {
+		if v.MinReplicas != 0 {
+			return fmt.Errorf("modeldeployment %q: InitialCooldownPeriod requires MinReplicas=0", v.Name)
+		}
+		if *v.InitialCooldownPeriod < 0 || *v.InitialCooldownPeriod > 2147483647 {
+			return fmt.Errorf("modeldeployment %q: InitialCooldownPeriod must be between 0 and 2147483647", v.Name)
+		}
+	}
+	if v.ScaleDownStabilizationWindow != nil && (*v.ScaleDownStabilizationWindow < 0 || *v.ScaleDownStabilizationWindow > 3600) {
+		return fmt.Errorf("modeldeployment %q: ScaleDownStabilizationWindow must be between 0 and 3600", v.Name)
+	}
+	for name, period := range map[string]*int64{"ScaleUpPeriodSeconds": v.ScaleUpPeriodSeconds, "ScaleDownPeriodSeconds": v.ScaleDownPeriodSeconds} {
+		if period != nil && (*period < 1 || *period > 1800) {
+			return fmt.Errorf("modeldeployment %q: %s must be between 1 and 1800", v.Name, name)
+		}
 	}
 	if len(v.ScalingMetrics) == 0 {
 		return nil

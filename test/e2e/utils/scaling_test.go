@@ -20,6 +20,7 @@ import (
 	"context"
 	"reflect"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,6 +29,44 @@ import (
 
 	"github.com/kaito-project/production-stack/test/e2e/deploy"
 )
+
+func TestScalingTimingParams(t *testing.T) {
+	so := map[string]interface{}{}
+	for _, field := range []struct {
+		path  []string
+		value int64
+	}{
+		{[]string{"spec", "pollingInterval"}, 15},
+		{[]string{"spec", "cooldownPeriod"}, 60},
+		{[]string{"spec", "initialCooldownPeriod"}, 120},
+		{[]string{"spec", "advanced", "horizontalPodAutoscalerConfig", "behavior", "scaleUp", "stabilizationWindowSeconds"}, 60},
+		{[]string{"spec", "advanced", "horizontalPodAutoscalerConfig", "behavior", "scaleDown", "stabilizationWindowSeconds"}, 300},
+	} {
+		if err := unstructured.SetNestedField(so, field.value, field.path...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for direction, seconds := range map[string]int64{"scaleUp": 900, "scaleDown": 1800} {
+		if err := unstructured.SetNestedSlice(so, []interface{}{map[string]interface{}{"periodSeconds": seconds}},
+			"spec", "advanced", "horizontalPodAutoscalerConfig", "behavior", direction, "policies"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p := scalingTimingParams(so)
+	if p.InitialCooldownPeriod != 120*time.Second || p.CooldownPeriod != time.Minute {
+		t.Fatalf("initial and ordinary cooldowns must remain independent: %+v", p)
+	}
+	if p.ScaleUpTotalWait != 930*time.Second || p.ScaleDownTotalWait != 1830*time.Second {
+		t.Fatalf("wait budgets must include the longer rate-limit period: %+v", p)
+	}
+	// Explicit zero must not fall back to a nonzero default.
+	if err := unstructured.SetNestedField(so, int64(0), "spec", "initialCooldownPeriod"); err != nil {
+		t.Fatal(err)
+	}
+	if scalingTimingParams(so).InitialCooldownPeriod != 0 {
+		t.Fatal("explicit initial cooldown zero was lost")
+	}
+}
 
 func modelPod(name, node string, phase corev1.PodPhase, ready corev1.ConditionStatus, labels map[string]string) *corev1.Pod {
 	return &corev1.Pod{

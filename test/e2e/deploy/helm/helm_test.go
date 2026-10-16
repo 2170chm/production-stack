@@ -26,6 +26,8 @@ import (
 	"strings"
 	"testing"
 
+	"k8s.io/utils/ptr"
+
 	"github.com/kaito-project/production-stack/test/e2e/deploy"
 )
 
@@ -316,7 +318,11 @@ func TestInstallModelDeploymentMapsScaleToZero(t *testing.T) {
 	values := deploy.ModelDeploymentValues{
 		Name: "phi", Namespace: "e2e-ns", Model: "phi-4-mini-instruct",
 		Replicas: 1, EnableScaling: true, MinReplicas: 0, MaxReplicas: 1, CooldownPeriod: 60,
-		DisableBenchmark: true,
+		DisableBenchmark:             true,
+		InitialCooldownPeriod:        ptr.To(int64(0)),
+		ScaleDownStabilizationWindow: ptr.To(int64(300)),
+		ScaleUpPeriodSeconds:         ptr.To(int64(300)),
+		ScaleDownPeriodSeconds:       ptr.To(int64(300)),
 	}
 
 	if err := d.InstallModelDeployment(context.Background(), values); err != nil {
@@ -325,6 +331,8 @@ func TestInstallModelDeploymentMapsScaleToZero(t *testing.T) {
 	args := (*calls)[0]
 	for _, want := range []string{
 		"replicas=1", "minReplicas=0", "maxReplicas=1", "scaling.cooldownPeriod=60", "enableBenchmark=false",
+		"scaling.initialCooldownPeriod=0", "scaling.hpa.scaleDown.stabilizationWindowSeconds=300",
+		"scaling.hpa.scaleUp.periodSeconds=300", "scaling.hpa.scaleDown.periodSeconds=300",
 	} {
 		if !hasArg(args, want) {
 			t.Errorf("missing --set %q in %v", want, args)
@@ -373,6 +381,30 @@ func TestInstallValidatesBeforeInvokingHelm(t *testing.T) {
 				Name: "phi", Model: "phi", EnableScaling: true, MinReplicas: 1, MaxReplicas: 2, CooldownPeriod: 60,
 			},
 			wantErr: "CooldownPeriod requires MinReplicas=0",
+		},
+		{
+			name: "initial cooldown with positive minimum",
+			values: deploy.ModelDeploymentValues{
+				Name: "phi", Model: "phi", EnableScaling: true, MinReplicas: 1, MaxReplicas: 2,
+				InitialCooldownPeriod: ptr.To(int64(0)),
+			},
+			wantErr: "InitialCooldownPeriod requires MinReplicas=0",
+		},
+		{
+			name: "invalid stabilization window",
+			values: deploy.ModelDeploymentValues{
+				Name: "phi", Model: "phi", EnableScaling: true, MinReplicas: 1, MaxReplicas: 2,
+				ScaleDownStabilizationWindow: ptr.To(int64(3601)),
+			},
+			wantErr: "ScaleDownStabilizationWindow must be between 0 and 3600",
+		},
+		{
+			name: "invalid scale-up policy period",
+			values: deploy.ModelDeploymentValues{
+				Name: "phi", Model: "phi", EnableScaling: true, MinReplicas: 1, MaxReplicas: 2,
+				ScaleUpPeriodSeconds: ptr.To(int64(0)),
+			},
+			wantErr: "ScaleUpPeriodSeconds must be between 1 and 1800",
 		},
 		{
 			name: "zero without activation metric",

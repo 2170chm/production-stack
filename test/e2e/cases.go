@@ -23,6 +23,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2" //nolint:revive // Ginkgo DSL
 	. "github.com/onsi/gomega"    //nolint:revive // Gomega DSL
+	"k8s.io/utils/ptr"
 
 	"github.com/kaito-project/production-stack/test/e2e/deploy"
 	"github.com/kaito-project/production-stack/test/e2e/utils"
@@ -367,14 +368,17 @@ var CaseDeployments = map[string][]deploy.ModelDeploymentValues{
 			// when the queue drains and clamps to minReplicaCount=1, so the
 			// pool would never return to its starting size and Scale-Down
 			// assertions would fail.
-			Name:          "scaling-phi",
-			Namespace:     "e2e-scaling",
-			Model:         presetPhi,
-			Replicas:      1,
-			InstanceType:  scalingInstanceType,
-			EnableScaling: true,
-			MinReplicas:   1,
-			MaxReplicas:   2,
+			Name:                         "scaling-phi",
+			Namespace:                    "e2e-scaling",
+			Model:                        presetPhi,
+			Replicas:                     1,
+			InstanceType:                 scalingInstanceType,
+			EnableScaling:                true,
+			MinReplicas:                  1,
+			MaxReplicas:                  2,
+			ScaleDownStabilizationWindow: ptr.To(int64(300)),
+			ScaleUpPeriodSeconds:         ptr.To(int64(300)),
+			ScaleDownPeriodSeconds:       ptr.To(int64(300)),
 			// Caps concurrent sequences per pod so a modest workload builds
 			// a waiting queue even on an H100. The ConfigMap is created by
 			// the scaling spec before install.

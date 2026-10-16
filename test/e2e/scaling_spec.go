@@ -166,6 +166,8 @@ var _ = Describe("InferenceSet Scaling — Infra",
 					values := scalingValues
 					values.MinReplicas = 0
 					values.CooldownPeriod = 60
+					initialCooldown := int64(60)
+					values.InitialCooldownPeriod = &initialCooldown
 					values.ScalingMetrics = slices.Clone(values.ScalingMetrics)
 					values.ScalingMetrics[0].Source = "modelpod"
 					values.ScalingMetrics[0].DeactivationThreshold = "0"
@@ -201,7 +203,7 @@ var _ = Describe("InferenceSet Scaling — Infra",
 				It("parks the warm model and releases its GPU NodeClaim while EPP stays ready", func() {
 					Eventually(func() (int32, error) {
 						return utils.GetInferenceSetReplicas(ctx, scalingModel, scalingNamespace)
-					}, base.keda.ScaleDownTotalWait+base.keda.CooldownPeriod+scaleToZeroProvisioningMargin, 5*time.Second).
+					}, max(base.keda.InitialCooldownPeriod, base.keda.CooldownPeriod)+scaleToZeroProvisioningMargin, 5*time.Second).
 						Should(Equal(int32(0)))
 					expectReadyModelPods(ctx, scalingValues, 0, scalingPodRemovalTimeout)
 					Expect(assertEPPReady(ctx, scalingNamespace, scalingModel)).To(Succeed())
@@ -228,10 +230,6 @@ var _ = Describe("InferenceSet Scaling — Infra",
 					Eventually(func() int64 {
 						return coldLoad.Stats().Success
 					}, 2*time.Minute, time.Second).Should(BeNumerically(">", 0))
-					coldLoad.Stop()
-					stats := coldLoad.Stats()
-					GinkgoWriter.Printf("cold-start load: %+v\n", stats)
-					Expect(stats.Errors5xx).To(BeNumerically("<=", 3*scaleToZeroColdLoadConcurrency), "cold-start load: %+v", stats)
 					Expect(utils.CheckChatSuccess(ctx, gateway, scalingModel, utils.WithMaxTokens(scalingMaxTokens))).To(Succeed())
 				})
 
@@ -321,6 +319,31 @@ var _ = Describe("InferenceSet Scaling — Infra",
 						MaxTokens:   scalingMaxTokens,
 					}
 					bulkLoad.Start(ctx)
+					handoffStarted := time.Now()
+					By("Keeping cold-start demand until KEDA observes active bulk traffic")
+					Eventually(func(g Gomega) {
+						replicas, err := utils.GetInferenceSetReplicas(ctx, scalingModel, scalingNamespace)
+						g.Expect(err).NotTo(HaveOccurred())
+						if replicas == 0 {
+							StopTrying("InferenceSet parked during the cold-to-bulk load handoff").Now()
+						}
+						dynClient, err := utils.GetDynamicClient()
+						g.Expect(err).NotTo(HaveOccurred())
+						so, err := dynClient.Resource(utils.ScaledObjectGVR).Namespace(scalingNamespace).
+							Get(ctx, scalingModel, metav1.GetOptions{})
+						g.Expect(err).NotTo(HaveOccurred())
+						lastActive, found, err := unstructured.NestedString(so.Object, "status", "lastActiveTime")
+						g.Expect(err).NotTo(HaveOccurred())
+						g.Expect(found).To(BeTrue(), "KEDA must record active demand")
+						activeAt, err := time.Parse(time.RFC3339, lastActive)
+						g.Expect(err).NotTo(HaveOccurred())
+						g.Expect(activeAt.After(handoffStarted)).To(BeTrue(), "lastActiveTime=%s must advance after bulk load starts", lastActive)
+					}, base.keda.ScaleUpTotalWait, 5*time.Second).Should(Succeed())
+					coldLoad.Stop()
+					stats := coldLoad.Stats()
+					GinkgoWriter.Printf("cold-start load through handoff: %+v\n", stats)
+					Expect(stats.Success).To(BeNumerically(">", 0))
+					Expect(stats.Errors5xx).To(BeNumerically("<=", 3*scaleToZeroColdLoadConcurrency), "cold-start load: %+v", stats)
 
 					clientset, err := utils.GetK8sClientset()
 					Expect(err).NotTo(HaveOccurred())
@@ -344,10 +367,15 @@ var _ = Describe("InferenceSet Scaling — Infra",
 				It("A2: KEDA bumps InferenceSet.spec.replicas", func() {
 					expected := base.replicas + 1
 					By(fmt.Sprintf("Waiting for .spec.replicas to reach %d", expected))
-					Eventually(func() (int32, error) {
-						return utils.GetInferenceSetReplicas(ctx, scalingModel, scalingNamespace)
+					Eventually(func(g Gomega) {
+						replicas, err := utils.GetInferenceSetReplicas(ctx, scalingModel, scalingNamespace)
+						g.Expect(err).NotTo(HaveOccurred())
+						if replicas == 0 {
+							StopTrying("InferenceSet parked while capacity-scaling load was active").Now()
+						}
+						g.Expect(replicas).To(BeNumerically(">=", expected))
 					}, base.keda.ScaleUpTotalWait+60*time.Second, 5*time.Second).
-						Should(BeNumerically(">=", expected),
+						Should(Succeed(),
 							"KEDA should bump replicas from %d to >=%d within %s",
 							base.replicas, expected, base.keda.ScaleUpTotalWait+60*time.Second)
 				})
@@ -510,6 +538,9 @@ var _ = Describe("InferenceSet Scaling — Infra",
 						r, err := utils.GetInferenceSetReplicas(ctx, scalingModel, scalingNamespace)
 						g.Expect(err).NotTo(HaveOccurred())
 						last = r
+						if r == 0 {
+							StopTrying("InferenceSet parked before the background workload was stopped").Now()
+						}
 						g.Expect(r).To(Equal(base.replicas),
 							"replicas should drop to %d, now %d", base.replicas, r)
 					}, base.keda.ScaleDownTotalWait+2*time.Minute, 15*time.Second).Should(Succeed())
@@ -691,7 +722,7 @@ var _ = Describe("InferenceSet Scaling — Infra",
 				}
 				// Passively wait one cooldown so the next case starts fresh.
 				// (Only pays the full window when a test actually caused a scale event.)
-				time.Sleep(base.keda.CooldownPeriod)
+				time.Sleep(max(base.keda.ScaleUpRatePeriod, base.keda.ScaleDownRatePeriod))
 			})
 
 			It("H1: stays at baseline when pressure is held below threshold", func() {
@@ -757,14 +788,13 @@ var _ = Describe("InferenceSet Scaling — Infra",
 				//   - replicas hold at baseline for the full HPA scale-up
 				//     stabilization window after tDown (safety / no oscillation),
 				//   - replicas DO scale up again once the window has elapsed
-				//     plus one polling interval of slack (liveness / not stuck).
+				//     plus any HPA rate-limit period (liveness / not stuck).
 				//
 				// NOTE on KEDA semantics: spec.cooldownPeriod only gates
 				// scale-to-zero (it kicks in when the last trigger reports
 				// inactive and minReplicaCount is 0). With minReplicaCount>=1,
-				// the actual anti-oscillation gate after a scale-down is the
-				// HPA scale-up stabilizationWindowSeconds, which keda-kaito-scaler
-				// sets via spec.advanced.horizontalPodAutoscalerConfig.behavior.
+				// HPA stabilization and rate-limit policies are independent gates.
+				// Liveness also allows the configured scale-up rate-limit period.
 
 				By("Scale-Up: driving pressure")
 				bulk := &utils.LoadGenerator{
@@ -821,8 +851,7 @@ var _ = Describe("InferenceSet Scaling — Infra",
 				//
 				//   liveness zone:    [antiFlapBoundary + slack, endAt]
 				//                     replicas MUST eventually reach >= base+1,
-				//                     proving the stabilization window was the
-				//                     only gate.
+				//                     proving scaling resumes after the gates.
 				//
 				// Sample at min(PollingInterval/3, 5s) so the strict zone has
 				// at least 5 sample points even at the default 60s window.
@@ -893,7 +922,7 @@ var _ = Describe("InferenceSet Scaling — Infra",
 				}
 				Expect(seenScaleUpInLiveness).To(BeTrue(),
 					"after the anti-flapping window + slack (%s after tDown), replicas should "+
-						"scale up again (proves stabilization was the only gate). all samples: %s",
+						"scale up again (allowing the HPA rate-limit period). all samples: %s",
 					base.keda.ScaleUpStabilization+slack, renderSamples())
 			})
 		})

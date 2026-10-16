@@ -231,6 +231,8 @@ failures can be localised.
 
 Warm-bootstrap one replica (GPU-mocked or real H100), then upgrade the same release to a zero-minimum, two-maximum ScaledObject with EPP flow control. Verify the idle model parks and releases its GPU NodeClaim while EPP remains Ready. Sustained authenticated requests must wake one replica and keep it through provisioning; cold-start delivery is best effort, with eventual success and bounded 5xx responses.
 
+The E2E explicitly sets HPA scale-down stabilization and both scaling policy periods to 300 seconds, with initial and ordinary zero cooldowns of 60 seconds. These test overrides do not change production defaults. Cold-start demand continues until the bulk workload has started and KEDA records a newer active timestamp; unexpected parking during this handoff or capacity scaling fails immediately. Timing budgets read initial cooldown, stabilization, and rate-limit periods independently from the ScaledObject.
+
 On that same deployment, run the Scale-Up and Scale-Down assertions above: queue pressure, replica increase, new GPU node and NodeClaim, routing to the new pod, queue drain, replica decrease, inventory cleanup, and no 5xx during the two-to-one transition. A single background worker sends back-to-back long-response requests (up to 1,024 tokens each) to keep the remaining replica active without building a waiting queue. Stop that worker, verify the deployment returns to zero, and verify all case-created NodeClaims are released while EPP remains Ready. Anti-flapping runs separately after restoring a one-replica minimum.
 
 ## Unknown model / malformed request handling — Routing

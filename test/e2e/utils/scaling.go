@@ -56,6 +56,9 @@ type KEDAParams struct {
 	Threshold              int
 	PollingInterval        time.Duration
 	CooldownPeriod         time.Duration
+	InitialCooldownPeriod  time.Duration
+	ScaleUpRatePeriod      time.Duration
+	ScaleDownRatePeriod    time.Duration
 	ScaleUpStabilization   time.Duration
 	ScaleDownStabilization time.Duration
 	ScaleUpTotalWait       time.Duration // polling + upStabilization + margin
@@ -76,27 +79,7 @@ func GetKEDAParams(ctx context.Context, model, namespace string) (KEDAParams, er
 		return KEDAParams{}, fmt.Errorf("get ScaledObject %s/%s: %w", namespace, model, err)
 	}
 
-	p := KEDAParams{
-		PollingInterval:        DefaultKEDAPollingInterval,
-		CooldownPeriod:         DefaultKEDACooldownPeriod,
-		ScaleUpStabilization:   DefaultKEDAScaleUpStabilize,
-		ScaleDownStabilization: DefaultKEDAScaleDownStabilize,
-	}
-
-	if v, found, _ := unstructured.NestedInt64(so.Object, "spec", "pollingInterval"); found {
-		p.PollingInterval = time.Duration(v) * time.Second
-	}
-	if v, found, _ := unstructured.NestedInt64(so.Object, "spec", "cooldownPeriod"); found {
-		p.CooldownPeriod = time.Duration(v) * time.Second
-	}
-	if v, found, _ := unstructured.NestedInt64(so.Object, "spec", "advanced",
-		"horizontalPodAutoscalerConfig", "behavior", "scaleUp", "stabilizationWindowSeconds"); found {
-		p.ScaleUpStabilization = time.Duration(v) * time.Second
-	}
-	if v, found, _ := unstructured.NestedInt64(so.Object, "spec", "advanced",
-		"horizontalPodAutoscalerConfig", "behavior", "scaleDown", "stabilizationWindowSeconds"); found {
-		p.ScaleDownStabilization = time.Duration(v) * time.Second
-	}
+	p := scalingTimingParams(so.Object)
 
 	// Threshold is read from the first trigger's metadata.
 	triggers, found, _ := unstructured.NestedSlice(so.Object, "spec", "triggers")
@@ -116,11 +99,6 @@ func GetKEDAParams(ctx context.Context, model, namespace string) (KEDAParams, er
 		}
 	}
 	if p.Threshold == 0 {
-		// Fallback to the annotation on the InferenceSet. Since
-		// keda-kaito-scaler v0.6.1 the composite (multi-metric) config is
-		// carried in a single scaledobject.kaito.sh/metrics YAML list
-		// annotation; the per-replica scale-up threshold for the first
-		// metric lives under that list's first entry `upthreshold`.
 		is, err := dynClient.Resource(InferenceSetGVR).Namespace(namespace).Get(ctx, model, metav1.GetOptions{})
 		if err == nil {
 			if v, ok := is.GetAnnotations()["scaledobject.kaito.sh/metrics"]; ok {
@@ -134,11 +112,53 @@ func GetKEDAParams(ctx context.Context, model, namespace string) (KEDAParams, er
 			}
 		}
 	}
+	return p, nil
+}
+
+func scalingTimingParams(object map[string]interface{}) KEDAParams {
+	p := KEDAParams{
+		PollingInterval:        DefaultKEDAPollingInterval,
+		CooldownPeriod:         DefaultKEDACooldownPeriod,
+		ScaleUpStabilization:   DefaultKEDAScaleUpStabilize,
+		ScaleDownStabilization: DefaultKEDAScaleDownStabilize,
+	}
+
+	if v, found, _ := unstructured.NestedInt64(object, "spec", "pollingInterval"); found {
+		p.PollingInterval = time.Duration(v) * time.Second
+	}
+	if v, found, _ := unstructured.NestedInt64(object, "spec", "cooldownPeriod"); found {
+		p.CooldownPeriod = time.Duration(v) * time.Second
+	}
+	if v, found, _ := unstructured.NestedInt64(object, "spec", "initialCooldownPeriod"); found {
+		p.InitialCooldownPeriod = time.Duration(v) * time.Second
+	}
+	if v, found, _ := unstructured.NestedInt64(object, "spec", "advanced",
+		"horizontalPodAutoscalerConfig", "behavior", "scaleUp", "stabilizationWindowSeconds"); found {
+		p.ScaleUpStabilization = time.Duration(v) * time.Second
+	}
+	if v, found, _ := unstructured.NestedInt64(object, "spec", "advanced",
+		"horizontalPodAutoscalerConfig", "behavior", "scaleDown", "stabilizationWindowSeconds"); found {
+		p.ScaleDownStabilization = time.Duration(v) * time.Second
+	}
+
+	for direction, period := range map[string]*time.Duration{
+		"scaleUp": &p.ScaleUpRatePeriod, "scaleDown": &p.ScaleDownRatePeriod,
+	} {
+		policies, _, _ := unstructured.NestedSlice(object, "spec", "advanced",
+			"horizontalPodAutoscalerConfig", "behavior", direction, "policies")
+		for _, policy := range policies {
+			if entry, ok := policy.(map[string]interface{}); ok {
+				if seconds, ok := entry["periodSeconds"].(int64); ok {
+					*period = max(*period, time.Duration(seconds)*time.Second)
+				}
+			}
+		}
+	}
 
 	const margin = 15 * time.Second
-	p.ScaleUpTotalWait = p.PollingInterval + p.ScaleUpStabilization + margin
-	p.ScaleDownTotalWait = p.PollingInterval + p.ScaleDownStabilization + margin
-	return p, nil
+	p.ScaleUpTotalWait = p.PollingInterval + max(p.ScaleUpStabilization, p.ScaleUpRatePeriod) + margin
+	p.ScaleDownTotalWait = p.PollingInterval + max(p.ScaleDownStabilization, p.ScaleDownRatePeriod) + margin
+	return p
 }
 
 // GetInferenceSetReplicas returns the current .spec.replicas value of the

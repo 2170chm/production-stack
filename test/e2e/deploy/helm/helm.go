@@ -424,6 +424,18 @@ func setArgs(v deploy.ModelDeploymentValues) []string {
 		if v.CooldownPeriod > 0 {
 			args = append(args, "--set", "scaling.cooldownPeriod="+strconv.FormatInt(v.CooldownPeriod, 10))
 		}
+		if v.InitialCooldownPeriod != nil {
+			args = append(args, "--set", "scaling.initialCooldownPeriod="+strconv.FormatInt(*v.InitialCooldownPeriod, 10))
+		}
+		if v.ScaleDownStabilizationWindow != nil {
+			args = append(args, "--set", "scaling.hpa.scaleDown.stabilizationWindowSeconds="+strconv.FormatInt(*v.ScaleDownStabilizationWindow, 10))
+		}
+		if v.ScaleUpPeriodSeconds != nil {
+			args = append(args, "--set", "scaling.hpa.scaleUp.periodSeconds="+strconv.FormatInt(*v.ScaleUpPeriodSeconds, 10))
+		}
+		if v.ScaleDownPeriodSeconds != nil {
+			args = append(args, "--set", "scaling.hpa.scaleDown.periodSeconds="+strconv.FormatInt(*v.ScaleDownPeriodSeconds, 10))
+		}
 	}
 	if v.AutoUpgrade.Enabled {
 		args = append(args, "--set", "autoUpgrade.enabled=true")
